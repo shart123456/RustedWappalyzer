@@ -269,19 +269,6 @@ rust-wappalyzer/
     ├── debug/           # Debug builds
     └── release/         # Release builds
 ```
-
-## 🤝 Contributing
-
-We welcome contributions! Here's how you can help:
-
-### Ways to Contribute
-
-- 🐛 **Bug Reports**: Found a bug? [Open an issue](https://github.com/yourusername/rust-wappalyzer/issues)
-- ✨ **Feature Requests**: Have an idea? [Suggest a feature](https://github.com/yourusername/rust-wappalyzer/issues)
-- 🔧 **Code Contributions**: Submit a [pull request](https://github.com/yourusername/rust-wappalyzer/pulls)
-- 📚 **Documentation**: Improve docs or add examples
-- 🧪 **Testing**: Add test cases or report compatibility issues
-
 ### Development Guidelines
 
 1. **Fork** the repository
@@ -350,23 +337,3 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 - **Wappalyzer Database**: Used under fair use for technology detection
 - **Rust Dependencies**: Various open-source licenses (see `Cargo.toml`)
 
-## 🙏 Acknowledgments
-
-- **Wappalyzer Team**: For creating the original technology detection database
-- **dochne**: For preserving the last public commit of Wappalyzer
-- **Enthec**: For maintaining the community fork
-- **Rust Community**: For excellent crates and tooling
-- **Contributors**: Everyone who helped improve this project
-
-## 📞 Support
-
-- 📖 **Documentation**: Check this README and `--help` commands
-- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/yourusername/rust-wappalyzer/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/yourusername/rust-wappalyzer/discussions)
-- 📧 **Contact**: your.email@example.com
-
----
-
-⭐ **Star this repository** if you find it useful!
-
-**Made with ❤️ and 🦀 by the Rust community**
