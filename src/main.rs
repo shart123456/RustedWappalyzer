@@ -52,6 +52,9 @@ enum Commands {
         /// Output format (json, table, simple)
         #[arg(short, long, default_value = "table")]
         format: String,
+        /// Disable SSL verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
     },
     /// Analyze multiple URLs from a file
     Batch {
@@ -66,6 +69,9 @@ enum Commands {
         /// Minimum confidence threshold
         #[arg(short = 't', long, default_value = "50")]
         confidence: u8,
+        /// Disable SSL verification
+        #[arg(short = 'k', long)]
+        insecure: bool,
     },
     /// Update the Wappalyzer database
     Update {
@@ -212,11 +218,12 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new() -> Self {
+    pub fn new(insecure: bool) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("Standalone-Wappalyzer/1.0")
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(5))
+            .danger_accept_invalid_certs(insecure)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -884,10 +891,10 @@ pub struct StandaloneWappalyzer {
 }
 
 impl StandaloneWappalyzer {
-    pub async fn new() -> Result<Self, WappalyzerError> {
+    pub async fn new(insecure: bool) -> Result<Self, WappalyzerError> {
         println!("{}", "Initializing Standalone Wappalyzer...".cyan());
         let analyzer = Arc::new(TechnologyAnalyzer::new().await?);
-        let http_client = HttpClient::new();
+        let http_client = HttpClient::new(insecure);
         
         let (tech_count, cat_count) = analyzer.get_stats();
         println!("{} {} technologies and {} categories", 
@@ -927,7 +934,7 @@ impl StandaloneWappalyzer {
     }
 
     /// Analyze multiple URLs concurrently
-    pub async fn analyze_urls_batch(&self, urls: Vec<String>, concurrency: usize, min_confidence: u8) -> Vec<AnalysisResult> {
+    pub async fn analyze_urls_batch(&self, urls: Vec<String>, concurrency: usize, min_confidence: u8, insecure: bool) -> Vec<AnalysisResult> {
         use tokio::sync::Semaphore;
         
         let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -941,6 +948,7 @@ impl StandaloneWappalyzer {
             .user_agent("Standalone-Wappalyzer/1.0")
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(5))
+            .danger_accept_invalid_certs(insecure)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -1295,7 +1303,7 @@ mod benchmark {
         let test_urls = generate_test_urls(url_count);
         let start = Instant::now();
         
-        let results = wappalyzer.analyze_urls_batch(test_urls, concurrency, 50).await;
+        let results = wappalyzer.analyze_urls_batch(test_urls, concurrency, 50, false).await;
         
         let total_time = start.elapsed();
         let successful_analyses = results.iter().filter(|r| r.error.is_none()).count();
@@ -1322,13 +1330,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Analyze { url, verbose, confidence, format } => {
-            let wappalyzer = StandaloneWappalyzer::new().await?;
+        Commands::Analyze { url, verbose, confidence, format, insecure } => {
+            let wappalyzer = StandaloneWappalyzer::new(insecure).await?;
             let result = wappalyzer.analyze_url(&url, confidence).await;
             output::print_analysis_result(&result, &format, verbose);
         }
 
-        Commands::Batch { file, output, concurrency, confidence } => {
+        Commands::Batch { file, output, concurrency, confidence, insecure } => {
             let urls = fs::read_to_string(&file).await?
                 .lines()
                 .map(|line| line.trim().to_string())
@@ -1341,8 +1349,8 @@ async fn main() -> Result<()> {
 
             println!("{}", format!("📁 Loaded {} URLs from {}", urls.len(), file).green());
 
-            let wappalyzer = StandaloneWappalyzer::new().await?;
-            let results = wappalyzer.analyze_urls_batch(urls, concurrency, confidence).await;
+            let wappalyzer = StandaloneWappalyzer::new(insecure).await?;
+            let results = wappalyzer.analyze_urls_batch(urls, concurrency, confidence, insecure).await;
 
             if let Some(output_file) = output {
                 let json_output = serde_json::to_string_pretty(&results)?;
@@ -1394,7 +1402,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Benchmark { count, threads } => {
-            let wappalyzer = StandaloneWappalyzer::new().await?;
+            let wappalyzer = StandaloneWappalyzer::new(false).await?;
             let results = benchmark::run_benchmark(&wappalyzer, count, threads).await?;
             println!("\n{}", results.to_string().green());
         }
