@@ -105,6 +105,10 @@ pub struct Technology {
     pub categories: Vec<String>,
     pub website: Option<String>,
     pub description: Option<String>,
+    pub icon: Option<String>,
+    pub cpe: Option<String>,
+    pub saas: Option<bool>,
+    pub pricing: Option<Vec<String>>,
 }
 
 /// Analysis results for a URL
@@ -136,6 +140,12 @@ pub struct TechnologyDefinition {
     pub categories: Vec<u32>,
     #[serde(default)]
     pub icon: Option<String>,
+    #[serde(default)]
+    pub cpe: Option<String>,
+    #[serde(default)]
+    pub saas: Option<bool>,
+    #[serde(default)]
+    pub pricing: Option<Vec<String>>,
     
     // Detection patterns
     #[serde(default)]
@@ -666,6 +676,33 @@ impl TechnologyAnalyzer {
         // Analyze meta tags
         self.analyze_meta_tags(&response.body, &mut detected_technologies);
 
+        // Apply "implies" logic
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let current_detected: Vec<String> = detected_technologies.keys().cloned().collect();
+            
+            for tech_name in current_detected {
+                if let Some(tech_def) = self.database.technologies.get(&tech_name) {
+                    if let Some(implies) = &tech_def.implies {
+                        let implied_list = match implies {
+                            Value::String(s) => vec![s.clone()],
+                            Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                            _ => Vec::new(),
+                        };
+                        
+                        for implied in implied_list {
+                            if !detected_technologies.contains_key(&implied) {
+                                // Add implied technology with 100% confidence
+                                detected_technologies.insert(implied, (100, None));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Convert to Technology structs and filter by confidence
         detected_technologies
             .into_iter()
@@ -681,6 +718,10 @@ impl TechnologyAnalyzer {
                     categories,
                     website: tech_def.and_then(|def| def.website.clone()),
                     description: tech_def.and_then(|def| def.description.clone()),
+                    icon: tech_def.and_then(|def| def.icon.clone()),
+                    cpe: tech_def.and_then(|def| def.cpe.clone()),
+                    saas: tech_def.and_then(|def| def.saas),
+                    pricing: tech_def.and_then(|def| def.pricing.clone()),
                 }
             })
             .collect()
@@ -1083,6 +1124,17 @@ mod output {
                     }
                     if let Some(website) = &tech.website {
                         print!("\n    🌐 {}", website.blue().underline());
+                    }
+                    if let Some(saas) = tech.saas {
+                        if saas {
+                            print!("\n    ☁️  SaaS");
+                        }
+                    }
+                    if let Some(pricing) = &tech.pricing {
+                        print!("\n    💰 Pricing: {}", pricing.join(", ").yellow());
+                    }
+                    if let Some(cpe) = &tech.cpe {
+                        print!("\n    🔒 CPE: {}", cpe.dimmed());
                     }
                 }
                 println!();
