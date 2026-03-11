@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rusty-wappalyzer"
+version = "0.1.0"
+description = "Fast web technology fingerprinting via Rust+PyO3"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["python-bindings"]
+module-name = "rusty_wappalyzer"
+python-source = "python"

@@ -1,339 +1,349 @@
-# 🦀 Rust Wappalyzer
+# RustedWappalyzer
 
-A **high-performance, standalone** Rust implementation of [Wappalyzer](https://www.wappalyzer.com/) for web technology detection. This tool analyzes websites and identifies the technologies they use, including frameworks, CMS platforms, analytics tools, and much more.
+Web technology fingerprinting tool built in Rust. Detects 3,900+ technologies — frameworks, CDNs, analytics, infrastructure — with version extraction and optional CVE/PoC enrichment.
 
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](#)
+## Quick Start
 
-## ✨ Features
-
-- 🚀 **10-100x faster** than Python implementations
-- 🔄 **Concurrent processing** - analyze multiple URLs simultaneously
-- 📊 **Multiple output formats** - JSON, table, simple text
-- 🎯 **High accuracy** - uses authentic Wappalyzer database
-- 📈 **Progress tracking** - real-time progress bars
-- 🛡️ **Robust error handling** - intelligent fallback systems
-- 🎨 **Beautiful CLI** - colorized output with categorization
-- 📦 **Self-contained** - no external dependencies required
-- 🔧 **Configurable** - adjustable concurrency and confidence thresholds
-
-## 🚀 Quick Start
-
-### Installation
-
-#### Option 1: Build from Source
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/rust-wappalyzer.git
-cd rust-wappalyzer
+git clone https://github.com/shart123456/RustedWappalyzer
+cd RustedWappalyzer
+docker build -t wappalyzer .
+docker run -d -p 3000:3000 --name wappalyzer wappalyzer
+```
 
-# Build release version
+The API is now running at `http://localhost:3000`.
+
+---
+
+## API
+
+### Analyze a URL
+
+```bash
+curl -X POST http://localhost:3000/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
+```
+
+```json
+[
+  { "technology": "Nginx",      "version": "1.24.0", "confidence": 100, "categories": ["Web Servers"] },
+  { "technology": "React",      "version": "18.3.1", "confidence": 100, "categories": ["JavaScript Frameworks"] },
+  { "technology": "Tailwind CSS","version": "3.4.1",  "confidence": 100, "categories": ["UI Frameworks"] }
+]
+```
+
+**Request options:**
+
+| Field | Default | Description |
+|---|---|---|
+| `url` | required | Target URL |
+| `confidence` | `50` | Minimum confidence threshold (0–100) |
+| `insecure` | `false` | Skip SSL certificate verification |
+| `full_scan` | `false` | Probe well-known endpoints for extra version info |
+| `auto_escalate` | `false` | Re-run with `full_scan` automatically if any detected tech is missing a version |
+
+---
+
+### Batch Analyze
+
+```bash
+curl -X POST http://localhost:3000/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": ["https://example.com", "https://another.com"],
+    "concurrency": 5
+  }'
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `urls` | required | Array of target URLs (max 100) |
+| `concurrency` | `5` | Parallel requests |
+| `confidence` | `50` | Minimum confidence threshold |
+| `full_scan` | `false` | Probe extra endpoints |
+
+> **Note:** TLS mode for batch requests is controlled by the server's startup configuration (`--insecure` flag on `serve`), not a per-request field. SSRF validation for all URLs runs concurrently before any analysis begins.
+
+---
+
+### Wayback Comparison
+
+Compare the current tech stack against historical Wayback Machine snapshots (~1 year and ~2 years ago).
+
+```bash
+curl -X POST http://localhost:3000/wayback \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
+```
+
+Returns current technologies plus two historical snapshots, showing added/removed technologies and version changes over time.
+
+---
+
+### Other Endpoints
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Database info (technology count, categories)
+curl http://localhost:3000/info
+```
+
+---
+
+### API Authentication
+
+Set the `API_KEY` environment variable to require bearer token authentication on all endpoints:
+
+```bash
+docker run -d -p 3000:3000 -e API_KEY=mysecretkey wappalyzer
+```
+
+```bash
+curl -X POST http://localhost:3000/analyze \
+  -H "Authorization: Bearer mysecretkey" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
+```
+
+---
+
+### Rate Limiting
+
+The server enforces **60 requests per minute per IP**. Requests exceeding the limit receive `HTTP 429`.
+
+---
+
+### Response Caching
+
+Responses are cached in-memory (1,000 entries, 60-second TTL) keyed on URL + options. Repeated requests for the same URL return instantly.
+
+---
+
+## CLI
+
+```bash
+# Prerequisites: Rust toolchain, libssl-dev, pkg-config
 cargo build --release
 
-# The binary will be available at ./target/release/wappalyzer
+# Analyze a single URL (table output)
+./target/release/wappalyzer analyze https://example.com
+
+# JSON output
+./target/release/wappalyzer analyze https://example.com --format json
+
+# Simple one-per-line output
+./target/release/wappalyzer analyze https://example.com --format simple
+
+# Verbose output
+./target/release/wappalyzer analyze https://example.com --verbose
+
+# Full scan — probes extra endpoints for version info
+./target/release/wappalyzer analyze https://example.com --full-scan
+
+# Skip SSL verification
+./target/release/wappalyzer analyze https://example.com --insecure
+
+# Batch from file (one URL per line)
+./target/release/wappalyzer batch urls.txt --concurrency 10 --output results.json
+
+# Historical comparison via Wayback Machine
+./target/release/wappalyzer wayback https://example.com
+
+# Start the API server
+./target/release/wappalyzer serve --port 3000
+
+# Update the technology database
+./target/release/wappalyzer update
+
+# Force re-fetch (ignore cached database)
+./target/release/wappalyzer update --force
+
+# Show database stats
+./target/release/wappalyzer info
+
+# Run performance benchmark
+./target/release/wappalyzer benchmark --count 100 --threads 5
 ```
 
-#### Option 2: Direct Cargo Install
+---
+
+## Detection Layers
+
+Detection is performed across nine independent layers, then merged with noisy-OR confidence aggregation.
+
+| Layer | What it analyzes |
+|---|---|
+| **Headers** | HTTP response headers; targeted version extraction for Nginx, Rails, Next.js, Nuxt, Drupal, Joomla, Wix, Shopify, Ghost, Gatsby, Hugo |
+| **HTML** | Meta tags, SPA globals (`__NEXT_DATA__`, `window.__NUXT__`), Alpine.js, htmx, Inertia.js, meta[name=generator] |
+| **Scripts** | Script/CSS URL patterns; CDN path versions (`@5.3.3`), banner comments (`/*! Bootstrap v5.3.3 */`), JS globals |
+| **Meta tags** | Database meta tag pattern matching |
+| **CSS** | Inline CSS content scanning |
+| **Cookies** | Generic cookie detection: Express (`connect.sid`), Django (`csrftoken`), Laravel, Shopify, Google Analytics, Hotjar, HubSpot |
+| **CSP** | Content-Security-Policy domain parsing; 60+ SaaS/service mappings (Sentry, Intercom, Hotjar, Datadog, Stripe, Rollbar, Mixpanel, Zendesk, HubSpot, Cloudinary, etc.) |
+| **DNS** | CNAME chain analysis (40+ CDN/hosting patterns), MX records (12 email providers), TXT records; includes `www.` variant and A-record resolution |
+| **Probes** (`full_scan`) | `/package.json`, `/wp-json/`, `/actuator/info`, `/healthz`, `/readyz`, `/livez`, `/_health`, `/metrics` |
+
+### How Version Detection Works
+
+| Method | Example |
+|---|---|
+| HTTP response header | `Server: nginx/1.24.0` |
+| CDN URL path | `jquery@3.7.1/dist/jquery.min.js` |
+| Banner comment in JS/CSS | `/*! Bootstrap v5.3.3 */` |
+| JavaScript global | `exports.version = "18.3.1"` |
+| Script URL pattern | `pubads_impl_20240304.js` → GPT date version |
+| Meta generator tag | `<meta name="generator" content="WordPress 6.4.2">` |
+| SPA global object | `window.__NEXT_DATA__.buildId` |
+| Endpoint probing (`full_scan`) | `GET /package.json` → `{"dependencies": {...}}` |
+
+---
+
+## Optional: CVE & PoC Enrichment
+
+When a MongoDB instance is available, detected technologies are automatically enriched with CVE data and proof-of-concept references.
+
 ```bash
-# Install directly from repository
-cargo install --git https://github.com/yourusername/rust-wappalyzer.git
-
-# Now you can use 'wappalyzer' from anywhere
-wappalyzer --help
+docker run -d -p 3000:3000 \
+  -e MONGODB_URI=mongodb://localhost:27017 \
+  wappalyzer
 ```
 
-### Basic Usage
+The server connects to two optional databases:
+- **VulnVault** — CVE records indexed by technology name + version + CPE
+- **PocVault** — Proof-of-concept references indexed by CVE ID and CPE
 
-```bash
-# Analyze a single website
-./target/release/wappalyzer analyze https://github.com
+Enriched response fields:
 
-# Verbose output with detailed information
-./target/release/wappalyzer analyze https://github.com --verbose
-
-# JSON output format
-./target/release/wappalyzer analyze https://github.com --format json
-
-# Set confidence threshold (0-100)
-./target/release/wappalyzer analyze https://github.com --confidence 80
-```
-
-## 📖 Usage Examples
-
-### Single URL Analysis
-
-```bash
-# Basic analysis
-wappalyzer analyze https://stackoverflow.com
-
-# Detailed analysis with response information
-wappalyzer analyze https://stackoverflow.com --verbose
-
-# Machine-readable JSON output
-wappalyzer analyze https://stackoverflow.com --format json
-
-# Only show high-confidence detections
-wappalyzer analyze https://stackoverflow.com --confidence 90
-```
-
-### Batch Processing
-
-```bash
-# Create a file with URLs (one per line)
-echo -e "https://github.com\nhttps://stackoverflow.com\nhttps://reddit.com" > urls.txt
-
-# Process all URLs with 5 concurrent threads
-wappalyzer batch urls.txt --concurrency 5
-
-# Save results to JSON file
-wappalyzer batch urls.txt --output results.json --concurrency 10
-
-# Custom confidence threshold for batch processing
-wappalyzer batch urls.txt --confidence 75
-```
-
-### Database Management
-
-```bash
-# Show database information
-wappalyzer info
-
-# Force update the technology database
-wappalyzer update --force
-```
-
-### Performance Benchmarking
-
-```bash
-# Quick benchmark with 50 URLs
-wappalyzer benchmark --count 50 --threads 8
-
-# Comprehensive benchmark
-wappalyzer benchmark --count 100 --threads 10
-```
-
-## 🔧 Command Reference
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `analyze <URL>` | Analyze a single website |
-| `batch <file>` | Process multiple URLs from a file |
-| `info` | Show database statistics |
-| `update` | Update the Wappalyzer database |
-| `benchmark` | Run performance tests |
-
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--verbose, -v` | Show detailed output | `false` |
-| `--format, -f` | Output format (table, json, simple) | `table` |
-| `--confidence, -c` | Minimum confidence threshold (0-100) | `50` |
-| `--concurrency` | Number of concurrent requests | `5` |
-| `--output, -o` | Output file for results | `stdout` |
-| `--threads, -t` | Number of threads for benchmarking | `5` |
-| `--count` | Number of URLs for benchmarking | `100` |
-| `--force` | Force database update | `false` |
-
-## 📊 Performance
-
-### Benchmarks
-
-Our Rust implementation significantly outperforms other tools:
-
-| Implementation | URLs/Second | Memory Usage | Binary Size |
-|---------------|-------------|--------------|-------------|
-| **Rust Wappalyzer** | **15-25** | **~50MB** | **~8MB** |
-| Python Wappalyzer | 2-5 | ~200MB | N/A |
-| Node.js Wappalyzer | 8-12 | ~150MB | N/A |
-
-### Concurrency Benefits
-
-| Concurrency Level | Time (100 URLs) | Speedup |
-|------------------|------------------|---------|
-| 1 thread | ~60s | 1x |
-| 5 threads | ~15s | 4x |
-| 10 threads | ~8s | 7.5x |
-| 20 threads | ~6s | 10x |
-
-## 🎯 Output Examples
-
-### Table Format (Default)
-```
-🔍 Analysis Results for: https://github.com
-
-📂 JavaScript Frameworks
-  • React [95%] v18.2.0
-  • jQuery [85%] v3.6.0
-
-📂 Web Servers
-  • Nginx [100%]
-
-📂 CDN
-  • Cloudflare [90%]
-
-⏱️ Analysis completed in 1,234ms
-```
-
-### JSON Format
 ```json
 {
-  "url": "https://github.com",
-  "technologies": [
-    {
-      "name": "React",
-      "confidence": 95,
-      "version": "18.2.0",
-      "categories": ["JavaScript Frameworks"],
-      "website": "https://reactjs.org"
-    }
-  ],
-  "analysis_time_ms": 1234
+  "technology": "WordPress",
+  "version": "6.4.2",
+  "confidence": 95,
+  "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
+  "cves": ["CVE-2024-1234"],
+  "pocs": ["https://github.com/..."]
 }
 ```
 
-### Simple Format
-```
-https://github.com: React v18.2.0, jQuery v3.6.0, Nginx, Cloudflare
-```
+---
 
-## 🏗️ Architecture
+## Security
 
-### Technology Stack
+**SSRF Protection (dual-layer)** — Requests to internal infrastructure are blocked at two independent points:
 
-- **HTTP Client**: [`reqwest`](https://github.com/seanmonstar/reqwest) - High-level HTTP client
-- **Async Runtime**: [`tokio`](https://github.com/tokio-rs/tokio) - Asynchronous runtime
-- **JSON Processing**: [`serde`](https://github.com/serde-rs/serde) - Serialization framework
-- **CLI Framework**: [`clap`](https://github.com/clap-rs/clap) - Command line argument parser
-- **Progress Bars**: [`indicatif`](https://github.com/console-rs/indicatif) - Progress indicators
-- **Colored Output**: [`colored`](https://github.com/mackwic/colored) - Terminal colors
-- **Regex Engine**: [`regex`](https://github.com/rust-lang/regex) - Regular expressions
-- **Concurrency**: [`rayon`](https://github.com/rayon-rs/rayon) - Data parallelism
+1. **Pre-flight check** — `is_safe_url()` resolves the hostname via async DNS before the request is dispatched, providing a fast rejection with a human-readable error message.
+2. **DNS resolver hook** — In server mode, a custom `SsrfDnsResolver` is installed on the HTTP client and re-validates every resolved IP at TCP-connect time. This mitigates DNS rebinding attacks where a hostname resolves to a public IP during the pre-flight but rebinds to a private IP by the time the connection is made.
 
-### Data Sources
+Blocked address ranges:
+- Loopback (`127.0.0.0/8`, `::1`)
+- Private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+- Link-local (`169.254.0.0/16`, `fe80::/10`)
+- Unique local IPv6 (`fc00::/7`)
+- IPv4-mapped IPv6 (`::ffff:x.x.x.x`) for all of the above
 
-The tool fetches technology definitions from:
+**Response body cap** — Fetched pages are truncated at 10 MB to prevent memory exhaustion from abnormally large responses.
 
-1. **Primary**: [`dochne/wappalyzer`](https://github.com/dochne/wappalyzer) - Last commit before Wappalyzer went private
-2. **Fallback**: [`enthec/webappanalyzer`](https://github.com/enthec/webappanalyzer) - Community-maintained fork
+**Rate limiting** — 60 requests/minute per IP (sliding window), enforced server-side. Excess requests receive `HTTP 429`.
 
-### Database Structure
+**API key auth** — Optional bearer token via `API_KEY` env var. Comparison is constant-time to prevent timing attacks.
 
-- **Technologies**: 2,000+ technology definitions across 27 files (a.json - z.json, _.json)
-- **Categories**: 50+ categories (CMS, Analytics, JavaScript Frameworks, etc.)
-- **Patterns**: Regex patterns for HTML, headers, scripts, meta tags, and URLs
-- **Metadata**: Confidence scores, version detection, and technology relationships
+**Request body limit** — JSON request bodies are capped at 64 KB by the Actix-web layer.
 
-## 🛠️ Development
+---
 
-### Prerequisites
+## Python Bindings
 
-- Rust 1.70 or higher
-- Cargo (comes with Rust)
-
-### Building
+A Python package (`rusty_wappalyzer`) is available via [maturin](https://github.com/PyO3/maturin).
 
 ```bash
-# Debug build (faster compilation)
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Check code formatting
-cargo fmt
-
-# Lint code
-cargo clippy
+pip install maturin
+maturin develop --features python
 ```
 
-### Project Structure
+```python
+import rusty_wappalyzer
 
-```
-rust-wappalyzer/
-├── src/
-│   └── main.rs          # Main application code
-├── Cargo.toml           # Dependencies and metadata
-├── Cargo.lock           # Dependency lock file
-├── README.md            # This file
-└── target/              # Build artifacts
-    ├── debug/           # Debug builds
-    └── release/         # Release builds
-```
-### Development Guidelines
-
-1. **Fork** the repository
-2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
-3. **Make** your changes
-4. **Test** your changes (`cargo test`)
-5. **Format** code (`cargo fmt`)
-6. **Lint** code (`cargo clippy`)
-7. **Commit** changes (`git commit -m 'Add amazing feature'`)
-8. **Push** to branch (`git push origin feature/amazing-feature`)
-9. **Open** a Pull Request
-
-### Code Style
-
-- Follow standard Rust conventions
-- Use `cargo fmt` for formatting
-- Run `cargo clippy` for linting
-- Add tests for new functionality
-- Update documentation as needed
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-#### Network/SSL Issues
-```bash
-# Set SSL certificate path if needed
-export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+analyzer = rusty_wappalyzer.PyWappalyzer()
+results = analyzer.analyze("https://example.com")
+for tech in results:
+    print(tech.name, tech.version, tech.confidence)
 ```
 
-#### Memory Usage
-For large batch operations, consider:
-- Reducing concurrency: `--concurrency 3`
-- Processing smaller batches
-- Using a machine with more RAM
+---
 
-#### Timeout Issues
-For slow networks:
-- The tool has built-in 30-second timeouts
-- Slow sites will be skipped automatically
-- Check your internet connection
+## Logging
 
-#### Database Update Failures
-```bash
-# Force refresh the database
-wappalyzer update --force
+When running in server mode, logs are written to `logs/wappalyzer.log` with daily rotation, and to stderr. Log level defaults to `info`.
 
-# Check database info
-wappalyzer info
+---
+
+## Architecture
+
+```
+src/
+  main.rs          — CLI entry point (clap commands: analyze, batch, wayback, serve, update, info, benchmark)
+  lib.rs           — Public library API (StandaloneWappalyzer, analyze_url, analyze_urls_batch)
+  types.rs         — All shared data structures (Technology, Signal, WappalyzerConfig, …)
+  cache.rs         — Technology database fetch, load, and write; SHA-256 integrity check; favicon hash embedding
+  http_client.rs   — Shared fetch_with_client(); reqwest builder + SSRF DNS resolver; 10 MB body cap
+  confidence.rs    — Noisy-OR confidence aggregation
+  middleware.rs    — Per-IP sliding-window rate limiter (moka-backed)
+  output.rs        — CLI output formatting (table, json, simple)
+  benchmark.rs     — Performance benchmarking
+  wayback.rs       — Wayback Machine CDX API integration
+  vuln.rs          — VulnVault MongoDB CVE lookup
+  poc.rs           — PocVault MongoDB PoC lookup
+  alert.rs         — AlertVault KEV/GHSA advisory lookup
+  python.rs        — PyO3 bindings (feature-gated: --features python)
+  analyzer/
+    mod.rs         — TechnologyAnalyzer struct + pattern compilation (regex, JS, DNS)
+    layers/
+      headers.rs   — HTTP header detection + targeted version extraction
+      html.rs      — HTML heuristics, SPA globals, meta[name=generator]
+      scripts.rs   — Script/CSS URL analysis, banner comments, CDN path versions
+      meta.rs      — Database meta tag pattern matching
+      css.rs       — Inline CSS content scanning
+      cookies.rs   — Generic cookie detection (Express, Django, Laravel, …)
+      csp.rs       — Content-Security-Policy domain parsing (60+ SaaS mappings)
+      dns.rs       — CNAME/TXT/MX record analysis (40+ CDN patterns)
+      probes.rs    — Well-known endpoint probing (/package.json, /wp-json/, /healthz, …)
+  server/
+    mod.rs         — Actix-web server setup, app_data wiring, background cache refresh
+    handlers.rs    — /analyze, /batch, /wayback, /health, /info endpoints
+    cache.rs       — Hot-URL tracker; background auto-refresh loop (moka, 60s TTL)
 ```
 
-### Performance Tuning
+---
 
-| System Type | Recommended Concurrency |
-|-------------|-------------------------|
-| **Laptop/Desktop** | 5-10 threads |
-| **VPS/Cloud** | 10-20 threads |
-| **High-end Server** | 20-50 threads |
+## Configuration
 
-## 📄 License
+### Environment Variables
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+| Variable | Default | Description |
+|---|---|---|
+| `API_KEY` | _(none)_ | Bearer token required on all endpoints when set |
+| `MONGODB_URI` | _(none)_ | MongoDB connection string for CVE/PoC/KEV enrichment |
+| `WAPPALYZER_CACHE` | next to binary | Path to the cached technology database JSON file |
+| `WAPPALYZER_DB_URL` | `https://raw.githubusercontent.com/enthec/webappanalyzer/main/src` | Base URL for fetching the technology database. Override to use a corporate proxy or private mirror — the server will append `/technologies/{letter}.json` and `/categories.json` automatically. |
+| `RUST_LOG` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
 
-### Third-Party Licenses
+### Request/Concurrency Limits
 
-- **Wappalyzer Database**: Used under fair use for technology detection
-- **Rust Dependencies**: Various open-source licenses (see `Cargo.toml`)
+Default timeouts and limits (in `WappalyzerConfig`):
 
+| Setting | Default |
+|---|---|
+| HTTP request timeout | 30s |
+| Connect timeout | 10s |
+| Asset fetch timeout | 8s |
+| Probe timeout | 8s |
+| Favicon timeout | 8s |
+| Source map timeout | 10s |
+| Asset concurrency | 10 |
+| Probe concurrency | 8 |
+| Max batch size | 100 URLs |
+| Max response body | 10 MB (truncated with a warning log) |
+| User-Agent | Chrome 122 on Linux |
