@@ -201,12 +201,15 @@ async fn main() -> Result<()> {
             }
 
             // SSRF protection: reject any URL that resolves to a private/internal address.
+            // URLs that fail DNS or are unsafe are skipped with a warning; the rest proceed.
+            let mut safe_urls = Vec::with_capacity(urls.len());
             for u in &urls {
-                if let Err(e) = is_safe_url(u).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
+                match is_safe_url(u).await {
+                    Ok(_) => safe_urls.push(u.clone()),
+                    Err(e) => eprintln!("⚠ Skipping {}: {}", u, e),
                 }
             }
+            let urls = safe_urls;
 
             info!(file = %file, url_count = urls.len(), concurrency, full_scan, "Starting batch analysis");
             println!("{}", format!("📁 Loaded {} URLs from {}", urls.len(), file).green());

@@ -36,6 +36,11 @@ pub struct TechnologyAnalyzer {
     pub(crate) dns_patterns: HashMap<String, HashMap<String, Vec<Regex>>>,
     /// JS object/property patterns: tech_name → [compiled JS patterns]
     pub(crate) js_patterns: HashMap<String, Vec<CompiledJsPattern>>,
+    /// Supplemental CPE overrides: tech name → CPE string, from data/cpe_overrides.json.
+    pub(crate) cpe_overrides: HashMap<String, String>,
+    /// Version extraction patches: tech name → field name → pattern value.
+    /// Added at compile time for Segment C technologies (CPE present, version pattern missing).
+    pub(crate) version_patches: HashMap<String, HashMap<String, serde_json::Value>>,
 }
 
 impl TechnologyAnalyzer {
@@ -49,6 +54,8 @@ impl TechnologyAnalyzer {
             .map(|c| (c.id, c.name.clone()))
             .collect();
         let favicon_hashes = cache::load_favicon_hashes();
+        let cpe_overrides = cache::load_cpe_overrides();
+        let version_patches = cache::load_version_patches();
         let mut analyzer = Self {
             database,
             html_patterns: HashMap::new(),
@@ -64,9 +71,12 @@ impl TechnologyAnalyzer {
             favicon_hashes,
             dns_patterns: HashMap::new(),
             js_patterns: HashMap::new(),
+            cpe_overrides,
+            version_patches,
         };
 
         analyzer.compile_patterns()?;
+        analyzer.compile_version_patches()?;
         Ok(analyzer)
     }
 
@@ -258,6 +268,79 @@ impl TechnologyAnalyzer {
         Ok(())
     }
 
+    /// Merge version extraction patches from `data/version_patches.json` into the compiled
+    /// pattern maps. Called after `compile_patterns()` so DB patterns are not overwritten —
+    /// patch patterns are appended/merged in alongside the existing ones.
+    fn compile_version_patches(&mut self) -> Result<(), WappalyzerError> {
+        let patches: Vec<(String, HashMap<String, serde_json::Value>)> = self.version_patches
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (tech_name, fields) in patches {
+            for (field_name, value) in &fields {
+                match field_name.as_str() {
+                    "headers" => {
+                        if let Some(obj) = value.as_object() {
+                            let entry = self.header_patterns.entry(tech_name.clone()).or_default();
+                            for (hname, hpat) in obj {
+                                if let Ok(patterns) = Self::compile_pattern_value(hpat) {
+                                    entry.insert(hname.to_lowercase(), patterns);
+                                }
+                            }
+                        }
+                    }
+                    "meta" => {
+                        if let Some(obj) = value.as_object() {
+                            let entry = self.meta_patterns.entry(tech_name.clone()).or_default();
+                            for (mname, mpat) in obj {
+                                if let Ok(patterns) = Self::compile_pattern_value(mpat) {
+                                    entry.insert(mname.to_lowercase(), patterns);
+                                }
+                            }
+                        }
+                    }
+                    "html" => {
+                        if let Ok(patterns) = Self::compile_pattern_value(value) {
+                            self.html_patterns.entry(tech_name.clone()).or_default().extend(patterns);
+                        }
+                    }
+                    "cookies" => {
+                        if let Some(obj) = value.as_object() {
+                            let entry = self.cookie_patterns.entry(tech_name.clone()).or_default();
+                            for (cname, cpat) in obj {
+                                if let Ok(patterns) = Self::compile_pattern_value(cpat) {
+                                    entry.insert(cname.to_lowercase(), patterns);
+                                }
+                            }
+                        }
+                    }
+                    "js" => {
+                        if let Some(obj) = value.as_object() {
+                            let entry = self.js_patterns.entry(tech_name.clone()).or_default();
+                            for (path, pat_val) in obj {
+                                let full_path = format!("window.{}", path);
+                                match pat_val {
+                                    serde_json::Value::String(s) if s.is_empty() || s == ".*" => {
+                                        entry.push(CompiledJsPattern { path: full_path, pattern: None });
+                                    }
+                                    serde_json::Value::String(s) => {
+                                        if let Ok(Some(cp)) = Self::compile_single_pattern(s) {
+                                            entry.push(CompiledJsPattern { path: full_path, pattern: Some(cp) });
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compile a pattern value (string or array) into CompiledPattern structs
     fn compile_pattern_value(value: &Value) -> Result<Vec<CompiledPattern>, WappalyzerError> {
         let mut patterns = Vec::new();
@@ -419,6 +502,8 @@ impl TechnologyAnalyzer {
                 if confidence < min_confidence { return None; }
                 let tech_def = self.database.technologies.get(&name);
                 let categories = self.get_technology_categories(&name);
+                let cpe = tech_def.and_then(|def| def.cpe.clone())
+                    .or_else(|| self.cpe_overrides.get(&name).cloned());
                 Some(Technology {
                     name,
                     confidence,
@@ -428,7 +513,7 @@ impl TechnologyAnalyzer {
                     website: tech_def.and_then(|def| def.website.clone()),
                     description: tech_def.and_then(|def| def.description.clone()),
                     icon: tech_def.and_then(|def| def.icon.clone()),
-                    cpe: tech_def.and_then(|def| def.cpe.clone()),
+                    cpe,
                     saas: tech_def.and_then(|def| def.saas),
                     pricing: tech_def.and_then(|def| def.pricing.clone()),
                 })
@@ -554,7 +639,8 @@ impl TechnologyAnalyzer {
             website: tech_def.and_then(|d| d.website.clone()),
             description: tech_def.and_then(|d| d.description.clone()),
             icon: tech_def.and_then(|d| d.icon.clone()),
-            cpe: tech_def.and_then(|d| d.cpe.clone()),
+            cpe: tech_def.and_then(|d| d.cpe.clone())
+                .or_else(|| self.cpe_overrides.get(name).cloned()),
             saas: tech_def.and_then(|d| d.saas),
             pricing: tech_def.and_then(|d| d.pricing.clone()),
             signals: Vec::new(),

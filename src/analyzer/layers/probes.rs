@@ -156,6 +156,88 @@ pub fn build_probe_list(origin: &str, technologies: &[Technology], full_scan: bo
         add!("/metrics", "prometheus-metrics");
     }
 
+    // ── Prometheus buildinfo ─────────────────────────────────────────────
+    if nothing || has_any(&["prometheus"]) {
+        add!("/api/v1/status/buildinfo", "prometheus-buildinfo");
+    }
+
+    // ── Nextcloud / ownCloud ─────────────────────────────────────────────
+    if nothing || has_any(&["nextcloud", "owncloud"]) {
+        add!("/status.php", "nextcloud-status");
+    }
+
+    // ── Grafana ──────────────────────────────────────────────────────────
+    if nothing || has_any(&["grafana"]) {
+        add!("/api/health", "grafana-health");
+    }
+
+    // ── Gitea / Forgejo / Gogs ───────────────────────────────────────────
+    if nothing || has_any(&["gitea", "forgejo", "gogs"]) {
+        add!("/api/v1/version", "gitea-api-version");
+    }
+
+    // ── Rocket.Chat ──────────────────────────────────────────────────────
+    if nothing || has_any(&["rocket.chat", "rocketchat"]) {
+        add!("/api/v1/info", "rocketchat-info");
+    }
+
+    // ── Mattermost ───────────────────────────────────────────────────────
+    if nothing || has_any(&["mattermost"]) {
+        add!("/api/v4/system/ping", "mattermost-ping");
+    }
+
+    // ── Portainer ────────────────────────────────────────────────────────
+    if nothing || has_any(&["portainer"]) {
+        add!("/api/status", "portainer-status");
+    }
+
+    // ── Discourse ────────────────────────────────────────────────────────
+    if nothing || has_any(&["discourse"]) {
+        add!("/site.json", "discourse-site");
+    }
+
+    // ── HashiCorp Vault ──────────────────────────────────────────────────
+    if nothing || has_any(&["vault"]) {
+        add!("/v1/sys/health", "vault-health");
+    }
+
+    // ── HashiCorp Consul ─────────────────────────────────────────────────
+    if nothing || has_any(&["consul"]) {
+        add!("/v1/agent/self", "consul-self");
+    }
+
+    // ── Jenkins ──────────────────────────────────────────────────────────
+    if nothing || has_any(&["jenkins"]) {
+        add!("/api/json?tree=version", "jenkins-api");
+        add!("/login?from=%2F",        "jenkins-login");
+    }
+
+    // ── SonarQube ────────────────────────────────────────────────────────
+    if nothing || has_any(&["sonar"]) {
+        add!("/api/system/status", "sonarqube-status");
+    }
+
+    // ── Moodle ───────────────────────────────────────────────────────────
+    if nothing || has_any(&["moodle"]) {
+        add!("/lib/upgrade.txt", "moodle-upgrade");
+    }
+
+    // ── MediaWiki ────────────────────────────────────────────────────────
+    if nothing || has_any(&["mediawiki", "wiki"]) {
+        add!("/api.php?action=query&meta=siteinfo&siprop=general&format=json", "mediawiki-api");
+    }
+
+    // ── GitLab ───────────────────────────────────────────────────────────
+    if nothing || has_any(&["gitlab"]) {
+        add!("/-/health", "gitlab-health");
+        add!("/help",     "gitlab-help");
+    }
+
+    // ── Matomo (Piwik) ───────────────────────────────────────────────────
+    if nothing || has_any(&["matomo", "piwik"]) {
+        add!("/index.php?module=API&method=API.getMatomoVersion&format=json", "matomo-api");
+    }
+
     probes
 }
 
@@ -176,6 +258,14 @@ pub fn accepts_status_for_tag(tag: &str, status: u16) -> bool {
         "wp-uploads" => status == 200 || status == 403,
         // healthz/readyz/livez: 200 OK or 503 (unhealthy) both confirm the endpoint exists
         "healthz" | "readyz" | "livez" => status == 200 || status == 503,
+        // Vault /v1/sys/health: all non-404 status codes confirm Vault is present
+        // 200=init+unsealed, 429=standby, 472=sealed, 501=not initialized
+        "vault-health" => matches!(status, 200 | 429 | 472 | 501 | 503),
+        // Consul /v1/agent/self: 403 = ACLs enabled (still confirms Consul)
+        "consul-self" => status == 200 || status == 403,
+        // GitLab endpoints
+        "gitlab-health" => status == 200 || status == 503,
+        "gitlab-help"   => status == 200,
         _ => status == 200,
     }
 }
@@ -667,8 +757,15 @@ impl TechnologyAnalyzer {
                     }
                 }
                 "drupal-core-php" => {
-                    // 403 on /core/lib/Drupal.php is a strong Drupal signal
-                    if *status == 403 || body.to_lowercase().contains("drupal") {
+                    // 403 alone is far too weak — generic platform error pages
+                    // (Azure App Service "Web App - Unavailable", IIS, nginx
+                    // default 403, etc.) all return 403 for arbitrary paths.
+                    // Require Drupal-specific evidence in the body.
+                    let body_lower = body.to_lowercase();
+                    let drupal_marker = body_lower.contains("drupal")
+                        || body_lower.contains("access denied")
+                            && body_lower.contains("you are not authorized");
+                    if drupal_marker {
                         if let Some(tech) = find_tech("Drupal") {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "drupal-core-php", 85, None);
                         }
@@ -859,10 +956,20 @@ impl TechnologyAnalyzer {
                     }
                 }
                 "wp-uploads" => {
-                    // /wp-content/uploads/ — 200 (directory listing) or 403 (listing disabled)
-                    // both confirm WordPress is present.
-                    if let Some(tech) = find_tech("WordPress") {
-                        TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "wp-uploads", 85, None);
+                    // /wp-content/uploads/ — only fires when the response body
+                    // shows WordPress-specific evidence. A bare 403 from a
+                    // generic platform (Azure App Service, IIS) is NOT enough.
+                    // 200: require an index-of style directory listing OR a
+                    //      wp-content path reference in the body.
+                    // 403: require WordPress branding in the forbidden page.
+                    let body_lower = body.to_lowercase();
+                    let wp_evidence = body_lower.contains("wp-content")
+                        || body_lower.contains("wordpress")
+                        || (body_lower.contains("<title>index of") && body_lower.contains("uploads"));
+                    if wp_evidence {
+                        if let Some(tech) = find_tech("WordPress") {
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "wp-uploads", 85, None);
+                        }
                     }
                 }
                 "wp-plugin-readme" => {
@@ -910,6 +1017,263 @@ impl TechnologyAnalyzer {
                     if body.starts_with("# HELP") || body.starts_with("# TYPE") || body.contains("\n# HELP") {
                         if let Some(tech) = find_tech("prometheus") {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "/metrics", 92, None);
+                        }
+                    }
+                }
+                "prometheus-buildinfo" => {
+                    // {"status":"success","data":{"version":"2.48.0","goVersion":"go1.21.5",...}}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if val.get("status").and_then(|v| v.as_str()) == Some("success") {
+                            if let Some(ver) = val.pointer("/data/version").and_then(|v| v.as_str()) {
+                                if let Some(tech) = find_tech("Prometheus") {
+                                    TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "buildinfo", 100, Some(ver.to_string()));
+                                }
+                            }
+                            if let Some(go_ver) = val.pointer("/data/goVersion").and_then(|v| v.as_str()) {
+                                let clean = go_ver.trim_start_matches("go");
+                                if let Some(tech) = find_tech("Go") {
+                                    TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "buildinfo-go", 85, Some(clean.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                "nextcloud-status" => {
+                    // {"installed":true,"version":"28.0.1.2","versionstring":"Nextcloud Hub 8 (28.0.1)","productname":"Nextcloud",...}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if val.get("installed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let version = val.get("version").and_then(|v| v.as_str()).map(|s| {
+                                // Trim to major.minor.patch (strip 4th segment)
+                                s.splitn(4, '.').take(3).collect::<Vec<_>>().join(".")
+                            });
+                            let product = val.get("productname").and_then(|v| v.as_str()).unwrap_or("Nextcloud");
+                            let tech_name = if product.to_lowercase().contains("owncloud") { "ownCloud" } else { "Nextcloud" };
+                            if let Some(tech) = find_tech(tech_name) {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "status.php", 100, version);
+                            }
+                        }
+                    }
+                }
+                "grafana-health" => {
+                    // {"commit":"abc1234","database":"ok","version":"10.3.1"}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if let Some(ver) = val.get("version").and_then(|v| v.as_str()) {
+                            if let Some(tech) = find_tech("Grafana") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "grafana-health", 100, Some(ver.to_string()));
+                            }
+                        }
+                    }
+                }
+                "gitea-api-version" => {
+                    // {"version":"1.21.3+gitea-1.21.3"}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if let Some(ver) = val.get("version").and_then(|v| v.as_str()) {
+                            // Trim build metadata after '+'
+                            let clean_ver = ver.split('+').next().unwrap_or(ver);
+                            let tech = find_tech("Gitea")
+                                .or_else(|| find_tech("Forgejo"))
+                                .or_else(|| find_tech("Gogs"));
+                            if let Some(t) = tech {
+                                TechnologyAnalyzer::update_detection(new_detected, &t, "probe", "gitea-api", 100, Some(clean_ver.to_string()));
+                            }
+                        }
+                    }
+                }
+                "rocketchat-info" => {
+                    // {"info":{"version":"6.5.0",...},"success":true}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        let ver = val.pointer("/info/version")
+                            .or_else(|| val.get("version"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if ver.is_some() || body.to_lowercase().contains("rocketchat") || body.to_lowercase().contains("rocket.chat") {
+                            if let Some(tech) = find_tech("Rocket.Chat") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "rocketchat-info", 100, ver);
+                            }
+                        }
+                    }
+                }
+                "mattermost-ping" => {
+                    // {"status":"OK","android_latest_ver":"...","server_version":"9.5.0.9.5.0.abcdef"}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if val.get("status").and_then(|v| v.as_str()) == Some("OK") {
+                            let ver = val.get("server_version")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.split('.').take(3).collect::<Vec<_>>().join(".").into());
+                            if let Some(tech) = find_tech("Mattermost") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "mattermost-ping", 100, Some(ver.unwrap_or_default()));
+                            }
+                        }
+                    }
+                }
+                "portainer-status" => {
+                    // {"Version":"2.19.4","Database":"...","InstanceID":"..."}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if val.get("InstanceID").is_some() || val.get("Version").is_some() {
+                            let ver = val.get("Version").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            if let Some(tech) = find_tech("Portainer") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "portainer-status", 100, ver);
+                            }
+                        }
+                    }
+                }
+                "discourse-site" => {
+                    // Large JSON blob; look for discourse_version field
+                    static DISCOURSE_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r#""discourse_version"\s*:\s*"(\d+\.\d+\.\d+)""#).unwrap()
+                    });
+                    if body.contains("discourse_version") || body.contains("Discourse") {
+                        if let Some(tech) = find_tech("Discourse") {
+                            let ver = DISCOURSE_VER_RE.captures(body).map(|c| c[1].to_string());
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "discourse-site", 95, ver);
+                        }
+                    }
+                }
+                "vault-health" => {
+                    // {"initialized":true,"sealed":false,"standby":false,"version":"1.15.6",...}
+                    // Non-200 status codes also indicate Vault (429/472/501 are Vault-specific)
+                    if let Some(tech) = find_tech("Vault") {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                            let ver = val.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "vault-health", 100, ver);
+                        } else if matches!(*status, 429 | 472 | 501) {
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "vault-health", 90, None);
+                        }
+                    }
+                }
+                "consul-self" => {
+                    // {"Config":{"Datacenter":"dc1",...},"Member":{"Tags":{"build":"1.17.1:abc"},...}}
+                    if let Some(tech) = find_tech("Consul") {
+                        if *status == 403 {
+                            // ACLs enabled — strong Consul signal even without version
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "consul-self", 85, None);
+                        } else if let Ok(_) = serde_json::from_str::<serde_json::Value>(body) {
+                            static CONSUL_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                                Regex::new(r#""build"\s*:\s*"(\d+\.\d+\.\d+)"#).unwrap()
+                            });
+                            let ver = CONSUL_VER_RE.captures(body).map(|c| c[1].to_string());
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "consul-self", 100, ver);
+                        }
+                    }
+                }
+                "jenkins-api" => {
+                    // {"version":"2.440.1","url":"https://..."}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if let Some(ver) = val.get("version").and_then(|v| v.as_str()) {
+                            if let Some(tech) = find_tech("Jenkins") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "jenkins-api", 100, Some(ver.to_string()));
+                            }
+                        }
+                    }
+                }
+                "jenkins-login" => {
+                    static JENKINS_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"Jenkins\s+ver\.?\s*(\d+\.\d+(?:\.\d+)?)").unwrap()
+                    });
+                    if body.contains("Jenkins") || body.contains("jenkins") {
+                        if let Some(tech) = find_tech("Jenkins") {
+                            let ver = JENKINS_VER_RE.captures(body).map(|c| c[1].to_string());
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "jenkins-login", 85, ver);
+                        }
+                    }
+                }
+                "sonarqube-status" => {
+                    // {"health":"GREEN","causes":[],"version":"10.4.0.87286"}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if val.get("health").is_some() || val.get("status").is_some() {
+                            let ver = val.get("version").and_then(|v| v.as_str()).map(|s| {
+                                // "10.4.0.87286" → "10.4.0"
+                                s.splitn(4, '.').take(3).collect::<Vec<_>>().join(".")
+                            });
+                            if let Some(tech) = find_tech("SonarQube") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "sonarqube-status", 100, ver);
+                            }
+                        }
+                    }
+                }
+                "moodle-upgrade" => {
+                    // /lib/upgrade.txt: "=== Moodle 4.3 ===" or changelog entries
+                    static MOODLE_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"(?i)Moodle\s+(\d+\.\d+(?:\.\d+)?)").unwrap()
+                    });
+                    if body.to_lowercase().contains("moodle") {
+                        if let Some(cap) = MOODLE_VER_RE.captures(body) {
+                            if let Some(tech) = find_tech("Moodle") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "upgrade.txt", 90, Some(cap[1].to_string()));
+                            }
+                        }
+                    }
+                }
+                "mediawiki-api" => {
+                    // {"query":{"general":{"generator":"MediaWiki 1.42.1",...}}}
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if let Some(gen) = val.pointer("/query/general/generator").and_then(|v| v.as_str()) {
+                            static MW_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                                Regex::new(r"MediaWiki\s+(\d+\.\d+(?:\.\d+)?)").unwrap()
+                            });
+                            if let Some(cap) = MW_VER_RE.captures(gen) {
+                                if let Some(tech) = find_tech("MediaWiki") {
+                                    TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "mediawiki-api", 100, Some(cap[1].to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                "gitlab-health" => {
+                    if body.trim() == "GitLab OK" || body.contains("GitLab OK") {
+                        if let Some(tech) = find_tech("GitLab") {
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "gitlab-health", 90, None);
+                        }
+                    }
+                }
+                "gitlab-help" => {
+                    static GITLAB_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"GitLab(?:\s+(?:Enterprise|Community)\s+Edition)?\s+(\d+\.\d+\.\d+)").unwrap()
+                    });
+                    if body.contains("GitLab") {
+                        if let Some(cap) = GITLAB_VER_RE.captures(body) {
+                            if let Some(tech) = find_tech("GitLab") {
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "gitlab-help", 95, Some(cap[1].to_string()));
+                            }
+                        }
+                    }
+                }
+                "matomo-api" => {
+                    // Plain JSON string: "\"5.0.0\"" or {"value":"5.0.0"}
+                    static MATOMO_VER_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r#""(\d+\.\d+\.\d+)""#).unwrap()
+                    });
+                    if let Some(cap) = MATOMO_VER_RE.captures(body) {
+                        let tech = find_tech("Matomo").or_else(|| find_tech("Piwik"));
+                        if let Some(t) = tech {
+                            TechnologyAnalyzer::update_detection(new_detected, &t, "probe", "matomo-api", 100, Some(cap[1].to_string()));
+                        }
+                    }
+                }
+                "changelog" => {
+                    // Keep-a-Changelog: ## [1.2.3] - 2024-01-01
+                    // Simple header: # 1.2.3 or ## 1.2.3
+                    static CHANGELOG_KAC_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"(?m)^##\s+\[(\d+\.\d+(?:\.\d+)?)\]").unwrap()
+                    });
+                    static CHANGELOG_SIMPLE_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"(?m)^#{1,3}\s+v?(\d+\.\d+(?:\.\d+)?)[\s\r\n]").unwrap()
+                    });
+                    let ver = CHANGELOG_KAC_RE.captures(body)
+                        .or_else(|| CHANGELOG_SIMPLE_RE.captures(body))
+                        .map(|c| c[1].to_string());
+                    if let Some(ver) = ver {
+                        // Attribute to the first tech name found in the first 300 chars of the file
+                        let header = &body[..body.len().min(300)];
+                        let header_lc = header.to_lowercase();
+                        // Walk over detected technologies to find a name match
+                        for (tech_name, _) in &self.database.technologies {
+                            if tech_name.len() >= 4 && header_lc.contains(&tech_name.to_lowercase()) {
+                                if let Some(t) = find_tech(tech_name) {
+                                    TechnologyAnalyzer::update_detection(new_detected, &t, "probe", "changelog", 75, Some(ver));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

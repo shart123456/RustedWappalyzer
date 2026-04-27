@@ -25,6 +25,18 @@ pub(crate) fn cache_file_path() -> std::path::PathBuf {
 /// Eliminates the runtime file dependency — the binary carries the data itself.
 const FAVICON_HASHES_JSON: &str = include_str!("../data/favicon_hashes.json");
 
+/// Supplemental CPE overrides embedded at compile time (data/cpe_overrides.json).
+/// Maps Wappalyzer technology name → CPE 2.3 string for technologies that already
+/// extract a version but lack a CPE entry in the upstream Wappalyzer database.
+/// Populated by scripts/nvd_cpe_lookup.py; takes priority over the DB value when
+/// the DB has no CPE but never overrides a CPE that the DB already provides.
+const CPE_OVERRIDES_JSON: &str = include_str!("../data/cpe_overrides.json");
+
+/// Supplemental version extraction patches embedded at compile time (data/version_patches.json).
+/// Maps tech name → field name → pattern value, adding version extraction to Segment C
+/// technologies that have a CPE but no version pattern in the upstream database.
+const VERSION_PATCHES_JSON: &str = include_str!("../data/version_patches.json");
+
 /// Load favicon hash → tech name mapping from the embedded JSON blob.
 /// Returns empty map silently if the data is malformed.
 pub(crate) fn load_favicon_hashes() -> HashMap<i32, String> {
@@ -35,6 +47,40 @@ pub(crate) fn load_favicon_hashes() -> HashMap<i32, String> {
         Err(e) => {
             tracing::warn!("Failed to parse embedded favicon hashes: {} — favicon detection disabled", e);
             HashMap::new()
+        }
+    }
+}
+
+/// Load supplemental CPE override map from the embedded JSON blob.
+/// Returns empty map silently on parse failure so the binary still starts.
+pub(crate) fn load_cpe_overrides() -> HashMap<String, String> {
+    match serde_json::from_str::<HashMap<String, String>>(CPE_OVERRIDES_JSON) {
+        Ok(map) => {
+            if !map.is_empty() {
+                tracing::info!(count = map.len(), "CPE overrides loaded");
+            }
+            map
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse CPE overrides: {} — override CPEs disabled", e);
+            HashMap::new()
+        }
+    }
+}
+
+/// Load version extraction patches from the embedded JSON blob.
+/// Returns empty map silently on parse failure so the binary still starts.
+pub(crate) fn load_version_patches() -> std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>> {
+    match serde_json::from_str::<std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>>(VERSION_PATCHES_JSON) {
+        Ok(map) => {
+            if !map.is_empty() {
+                tracing::info!(count = map.len(), "Version patches loaded");
+            }
+            map
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse version patches: {} — version patches disabled", e);
+            std::collections::HashMap::new()
         }
     }
 }

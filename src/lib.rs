@@ -145,6 +145,8 @@ impl StandaloneWappalyzer {
 
         // --- fetch first 4 KB of each asset concurrently ---
         let semaphore = Arc::new(Semaphore::new(config.asset_concurrency));
+        // Copy out scalar config values needed inside the spawned tasks.
+        let asset_timeout_secs = config.asset_timeout_secs;
         let tasks: Vec<_> = asset_urls.into_iter().map(|url| {
             let client = client.clone();
             let sem = Arc::clone(&semaphore);
@@ -157,6 +159,7 @@ impl StandaloneWappalyzer {
                 } else {
                     let resp = client.get(&url)
                         .header("Range", "bytes=0-16383")
+                        .timeout(std::time::Duration::from_secs(asset_timeout_secs))
                         .send().await.ok()?;
                     let status = resp.status().as_u16();
                     if status == 200 || status == 206 {
@@ -218,9 +221,15 @@ impl StandaloneWappalyzer {
     ) {
         use tokio::sync::Semaphore;
 
+        // Preserve non-default ports so probes target the correct host:port.
+        // Stripping the port would cause `https://example.com:8443/...` to probe
+        // example.com:443 (the default), missing services on alternate ports.
         let origin = match url::Url::parse(base_url)
             .ok()
-            .and_then(|u| u.host_str().map(|h| format!("{}://{}", u.scheme(), h)))
+            .and_then(|u| u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{}://{}:{}", u.scheme(), h, p),
+                None    => format!("{}://{}",    u.scheme(), h),
+            }))
         {
             Some(o) => o,
             None => return,
@@ -466,7 +475,10 @@ impl StandaloneWappalyzer {
                 ).await;
                 // Favicon fingerprinting
                 analyzer.detect_favicon(client, url, &response.body, &mut technologies, config.favicon_timeout_secs).await;
-                if full_scan {
+                // Probe well-known endpoints: always when full_scan is requested,
+                // or automatically as a fallback when nothing was detected.
+                // Mirrors the single-URL path so /batch and /analyze behave identically.
+                if full_scan || technologies.is_empty() {
                     Self::probe_version_endpoints(
                         &analyzer,
                         client,
