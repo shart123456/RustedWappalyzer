@@ -23,7 +23,7 @@ impl TechnologyAnalyzer {
         };
 
         let mut opts = ResolverOpts::default();
-        opts.timeout = std::time::Duration::from_secs(5);
+        opts.timeout = std::time::Duration::from_secs(3);
         opts.attempts = 2;
 
         let resolver = AsyncResolver::tokio(ResolverConfig::default(), opts);

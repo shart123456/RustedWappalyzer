@@ -736,6 +736,29 @@ impl TechnologyAnalyzer {
         }
     }
 
+    /// Re-apply `excludes` / `requires` / `requires_category` gating to a
+    /// merged `Vec<Technology>` after late-stage layers (assets, favicon,
+    /// probes, DNS) have appended new detections.
+    ///
+    /// `apply_exclusions_and_requirements` runs inside `analyze()` over the
+    /// HTML/header/cookie pass only — without this final pass, late additions
+    /// can re-introduce techs whose dependencies were filtered out, e.g.
+    /// "Trident AB" (`requires: Shopify`) re-matching `Trident/` inside a
+    /// vendor JS UA-sniff block fetched by `inspect_assets`.
+    pub fn finalize_gating(&self, technologies: &mut Vec<Technology>) {
+        let mut detected: HashMap<String, TechDetection> = technologies
+            .iter()
+            .map(|t| (
+                t.name.clone(),
+                TechDetection {
+                    version: t.version.clone(),
+                    signals: t.signals.clone(),
+                },
+            ))
+            .collect();
+        Self::apply_exclusions_and_requirements(&mut detected, &self.database);
+        technologies.retain(|t| detected.contains_key(&t.name));
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +828,34 @@ mod tests {
         TechnologyAnalyzer::apply_exclusions_and_requirements(&mut detected, &db);
 
         assert!(!detected.contains_key("TechPlugin"), "TechPlugin should be removed — TechCore not detected");
+    }
+
+    #[test]
+    fn test_requires_array_form_is_enforced() {
+        // Regression: the cache stores `requires` as a JSON array (e.g. ["Shopify"])
+        // but the original test only covered the Value::String shape. Ensure the
+        // Value::Array branch also removes techs whose dependency is missing.
+        let mut technologies = HashMap::new();
+        technologies.insert("TridentLike".to_string(), TechnologyDefinition {
+            description: None, website: None, categories: vec![], icon: None, cpe: None,
+            saas: None, pricing: None, url: None, html: None, css: None, script: None,
+            script_src: None, scripts: None, meta: None, headers: None, cookies: None,
+            dom: None, js: None, xhr: None, text: None, cert_issuer: None, robots: None,
+            dns: None, implies: None, excludes: None,
+            requires: Some(Value::Array(vec![Value::String("Shopify".to_string())])),
+            requires_category: None,
+        });
+        let db = WappalyzerDatabase { technologies, categories: HashMap::new() };
+
+        let mut detected = HashMap::new();
+        detected.insert("TridentLike".to_string(), make_detection(vec![make_signal(100)]));
+
+        TechnologyAnalyzer::apply_exclusions_and_requirements(&mut detected, &db);
+
+        assert!(
+            !detected.contains_key("TridentLike"),
+            "TridentLike should be removed — Shopify not detected (Value::Array requires path)"
+        );
     }
 
     #[test]

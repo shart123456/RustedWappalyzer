@@ -62,8 +62,11 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     };
     let insecure_data = actix_web::web::Data::new(insecure_wappalyzer);
 
-    // Rate limiter: 60 requests per minute per IP.
-    let rate_limiter = actix_web::web::Data::new(crate::middleware::RateLimiter::new(60, 60));
+    // Rate limiter: 600 requests per minute per IP (10 req/s sustained).
+    // Sized for batch consumers; the analyzer's actual CPU work (regex + headers/body
+    // scan) is sub-100ms per call, so this is well below what one core can serve.
+    // Override at deploy time by changing the constants if you need stricter limits.
+    let rate_limiter = actix_web::web::Data::new(crate::middleware::RateLimiter::new(600, 60));
 
     // Optional API key — only enforced when the environment variable is set.
     let api_key: Option<String> = std::env::var("API_KEY").ok();

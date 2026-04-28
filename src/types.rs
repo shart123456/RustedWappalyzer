@@ -27,7 +27,8 @@ pub enum WappalyzerError {
 pub struct WappalyzerConfig {
     /// Total HTTP request timeout in seconds (default: 30)
     pub http_timeout_secs: u64,
-    /// HTTP connection timeout in seconds (default: 10)
+    /// HTTP connection timeout in seconds (default: 3).
+    /// Kept low so parked / firewalled domains fail fast and don't dominate batch wall-time.
     pub connect_timeout_secs: u64,
     /// Timeout for fetching linked assets (JS/CSS) in seconds (default: 8)
     pub asset_timeout_secs: u64,
@@ -59,7 +60,7 @@ impl Default for WappalyzerConfig {
     fn default() -> Self {
         Self {
             http_timeout_secs: 30,
-            connect_timeout_secs: 10,
+            connect_timeout_secs: 3,
             asset_timeout_secs: 8,
             probe_timeout_secs: 8,
             favicon_timeout_secs: 8,

@@ -161,7 +161,7 @@ fn check_auth_and_rate_limit(
         .unwrap_or_else(|| "unknown".to_string());
     if !rate_limiter.check(&ip) {
         return Err(HttpResponse::TooManyRequests().json(serde_json::json!({
-            "error": "Rate limit exceeded. Max 60 requests per minute."
+            "error": "Rate limit exceeded. Max 600 requests per minute."
         })));
     }
     if let Some(required_key) = api_key.as_deref() {

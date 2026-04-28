@@ -343,6 +343,10 @@ impl StandaloneWappalyzer {
                         full_scan,
                     ).await;
                 }
+                // Final gate: re-apply excludes / requires / requires_category over
+                // the merged tech list so late-stage layers (assets, favicon, probes,
+                // DNS) can't re-introduce techs whose dependencies are absent.
+                self.analyzer.finalize_gating(&mut technologies);
                 AnalysisResult {
                     url: url.to_string(),
                     technologies,

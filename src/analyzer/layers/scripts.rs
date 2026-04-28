@@ -156,17 +156,20 @@ impl TechnologyAnalyzer {
                 }
 
                 // ?ver= / ?v= query params: CMSs enqueue assets with the CMS core version.
-                //   /wp-includes/js/jquery.min.js?ver=6.5.3   → WordPress 6.5.3
-                //   /core/misc/drupalSettingsLoader.js?v=10.1.6 → Drupal 10.1.6
+                //   /wp-includes/js/wp-emoji-release.min.js?ver=6.5.3   → WordPress 6.5.3
+                //   /core/misc/drupalSettingsLoader.js?v=10.1.6         → Drupal 10.1.6
                 // Also fills in version gaps on any DB pattern match that captured no version.
                 if let Some(qver) = Self::extract_query_version(url) {
-                    // WordPress: assets under /wp-includes/ carry the WP core version.
-                    // Exception: /wp-includes/js/jquery/ URLs carry jQuery's own version,
-                    // not the WP core version — skip those to avoid false WP version.
-                    if url_lower.contains("/wp-includes/")
-                        && !url_lower.contains("/wp-includes/js/jquery/")
-                        && !url_lower.contains("/wp-includes/js/jquery-migrate")
-                    {
+                    // WordPress: only trust ?ver= when the asset's leaf filename is
+                    // `wp-*` (core asset) or it sits under `/wp-includes/dist/` or
+                    // `/wp-includes/blocks/` (block-editor / Gutenberg core). Vendored
+                    // libraries under `/wp-includes/js/<lib>/...` (mediaelement, jquery,
+                    // underscore, backbone, plupload, etc.) carry the LIBRARY version,
+                    // not the WP core version, so they're excluded.
+                    static WP_CORE_ASSET_RE: Lazy<Regex> = Lazy::new(|| {
+                        Regex::new(r"(?i)/wp-includes/(?:dist/|blocks/|[^/]*/)?wp-[a-z0-9_-]+\.(?:min\.)?(?:js|css)(?:\?|$)").unwrap()
+                    });
+                    if WP_CORE_ASSET_RE.is_match(url) {
                         if let Some(db_name) = self.find_tech_name("wordpress") {
                             Self::update_detection(detected, db_name, "script_src", url, 85, Some(qver.clone()));
                         }
@@ -198,14 +201,15 @@ impl TechnologyAnalyzer {
                     }
                     // Generic: if a DB script pattern matched this URL but captured no version,
                     // backfill with the query-param version.
-                    // Exception: never backfill WP core version from:
-                    //   - plugin asset URLs (/wp-content/plugins/): that ?ver= is the plugin version
-                    //   - jQuery URLs (/wp-includes/js/jquery/): that ?ver= is jQuery's version
-                    let is_wp_jquery_path = url_lower.contains("/wp-includes/js/jquery/");
+                    // For WordPress specifically, ONLY backfill from URLs that match the
+                    // WP-core asset shape (`wp-*.js` under `/wp-includes/`). Other paths
+                    // under `/wp-includes/` host vendored libraries (mediaelement, underscore,
+                    // backbone, plupload, etc.) whose `?ver=` is the LIBRARY version, and
+                    // `/wp-content/plugins/<slug>/...?ver=` is the PLUGIN version.
+                    let url_is_wp_core = WP_CORE_ASSET_RE.is_match(url);
                     for (tech_name, patterns) in &self.script_patterns {
-                        if (is_wp_plugin_path || is_wp_jquery_path)
-                            && tech_name.to_lowercase().contains("wordpress")
-                        {
+                        let tech_is_wp = tech_name.to_lowercase().contains("wordpress");
+                        if tech_is_wp && !url_is_wp_core {
                             continue;
                         }
                         for pattern in patterns {
@@ -291,10 +295,13 @@ impl TechnologyAnalyzer {
                             break;
                         }
                     }
-                    // WordPress stylesheet: /wp-content/themes/*/style.css?ver=X
+                    // WordPress stylesheet path is a presence signal, but `?ver=` on a
+                    // theme asset is the THEME version, not WP core — record presence
+                    // only (no version) so a downstream signal (meta generator,
+                    // /wp-includes/wp-*.{js,css}) can supply the real core version.
                     if url_lower.contains("/wp-content/themes/") {
                         if let Some(db_name) = self.find_tech_name("wordpress") {
-                            Self::update_detection(detected, db_name, "script_src", url, 80, Some(qver));
+                            Self::update_detection(detected, db_name, "script_src", url, 80, None);
                         }
                     }
                 }

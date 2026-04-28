@@ -11,6 +11,11 @@ use crate::types::{HttpResponse, WappalyzerConfig, WappalyzerError};
 /// Responses larger than this are truncated to avoid OOM on huge pages.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// DNS-resolution timeout for pre-flight `is_safe_url()` and the SSRF resolver.
+/// Cuts the long-tail of "system getaddrinfo blocks for ~10s on parked / dead
+/// domains" so batch scans fail those URLs fast.
+const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Returns `true` if the address falls within a private, loopback, link-local,
 /// or ULA range that should never be reachable from a public HTTP scanner.
 ///
@@ -78,9 +83,23 @@ impl Resolve for SsrfDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs = tokio::net::lookup_host(format!("{}:0", host))
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let addrs = match tokio::time::timeout(
+                DNS_LOOKUP_TIMEOUT,
+                tokio::net::lookup_host(format!("{}:0", host)),
+            )
+            .await
+            {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) => {
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                }
+                Err(_) => {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("DNS lookup for '{}' timed out after {:?}", host, DNS_LOOKUP_TIMEOUT),
+                    )) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            };
 
             let safe: Vec<SocketAddr> = addrs
                 .filter(|addr| !is_private_ip(addr.ip()))
@@ -210,10 +229,22 @@ pub async fn is_safe_url(url: &str) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or_else(|| "URL has no host".to_string())?;
 
-    // Resolve hostname → IP(s) asynchronously (avoids blocking the Tokio thread pool).
-    let addrs = tokio::net::lookup_host(format!("{}:80", host))
-        .await
-        .map_err(|e| format!("DNS resolution failed for '{}': {}", host, e))?;
+    // Resolve hostname → IP(s) asynchronously, bounded by DNS_LOOKUP_TIMEOUT so
+    // that parked / dead domains don't burn ~10s of system-resolver wall-time
+    // before being rejected.
+    let addrs = match tokio::time::timeout(
+        DNS_LOOKUP_TIMEOUT,
+        tokio::net::lookup_host(format!("{}:80", host)),
+    )
+    .await
+    {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => return Err(format!("DNS resolution failed for '{}': {}", host, e)),
+        Err(_) => return Err(format!(
+            "DNS resolution failed for '{}': lookup timed out after {:?}",
+            host, DNS_LOOKUP_TIMEOUT
+        )),
+    };
 
     for socket_addr in addrs {
         if is_private_ip(socket_addr.ip()) {
