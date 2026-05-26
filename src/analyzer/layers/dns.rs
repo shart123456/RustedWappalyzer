@@ -352,7 +352,7 @@ impl TechnologyAnalyzer {
             return;
         };
 
-        // 3. Fetch .map file (ignore errors)
+        // 3. Fetch .map file
         let map_body = match client
             .get(&map_url)
             .timeout(std::time::Duration::from_secs(source_map_timeout_secs))
@@ -361,9 +361,16 @@ impl TechnologyAnalyzer {
         {
             Ok(r) if r.status().is_success() => match r.text().await {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::debug!(url = %map_url, "source map body read failed: {}", e);
+                    return;
+                }
             },
-            _ => return,
+            Ok(_) => return, // non-2xx: not a real source map location, skip silently
+            Err(e) => {
+                tracing::debug!(url = %map_url, "source map fetch failed: {}", e);
+                return;
+            }
         };
 
         // 4. Parse JSON and extract "sources" array
@@ -452,9 +459,16 @@ impl TechnologyAnalyzer {
         {
             Ok(r) if r.status().is_success() => match r.bytes().await {
                 Ok(b) => b,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::debug!(url = %favicon_url, "favicon body read failed: {}", e);
+                    return;
+                }
             },
-            _ => return,
+            Ok(_) => return, // non-2xx (e.g. 404): favicon not present, skip silently
+            Err(e) => {
+                tracing::debug!(url = %favicon_url, "favicon fetch failed: {}", e);
+                return;
+            }
         };
 
         if bytes.is_empty() { return; }

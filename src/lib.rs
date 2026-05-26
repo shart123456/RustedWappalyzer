@@ -157,13 +157,26 @@ impl StandaloneWappalyzer {
                 let body_arc = if let Some(cached) = cache.get(&url) {
                     cached
                 } else {
-                    let resp = client.get(&url)
+                    let resp = match client.get(&url)
                         .header("Range", "bytes=0-16383")
                         .timeout(std::time::Duration::from_secs(asset_timeout_secs))
-                        .send().await.ok()?;
+                        .send().await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!(url = %url, "asset fetch failed: {}", e);
+                            return None;
+                        }
+                    };
                     let status = resp.status().as_u16();
                     if status == 200 || status == 206 {
-                        let content = resp.text().await.ok()?;
+                        let content = match resp.text().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::debug!(url = %url, "asset body read failed: {}", e);
+                                return None;
+                            }
+                        };
                         let arc = Arc::new(content);
                         cache.insert(url.clone(), Arc::clone(&arc));
                         arc

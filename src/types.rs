@@ -211,6 +211,14 @@ pub struct TechnologyDefinition {
     pub requires_category: Option<Value>,
 }
 
+/// A pre-parsed implies relationship entry
+#[derive(Debug, Clone)]
+pub struct ImpliedTech {
+    pub name: String,
+    pub weight: u8,
+    pub version: Option<String>,
+}
+
 /// Category definition from Wappalyzer database
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Category {

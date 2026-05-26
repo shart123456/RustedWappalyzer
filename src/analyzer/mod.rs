@@ -41,6 +41,11 @@ pub struct TechnologyAnalyzer {
     /// Version extraction patches: tech name → field name → pattern value.
     /// Added at compile time for Segment C technologies (CPE present, version pattern missing).
     pub(crate) version_patches: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Pre-parsed implies graph: tech name → list of implied techs with weight/version.
+    /// Built once at startup; used in `analyze()` to avoid repeated string parsing.
+    pub(crate) implies_graph: HashMap<String, Vec<ImpliedTech>>,
+    /// CSS selectors extracted from the `dom` field: tech name → list of selector strings.
+    pub(crate) dom_selectors: HashMap<String, Vec<String>>,
 }
 
 impl TechnologyAnalyzer {
@@ -73,11 +78,68 @@ impl TechnologyAnalyzer {
             js_patterns: HashMap::new(),
             cpe_overrides,
             version_patches,
+            implies_graph: HashMap::new(),
+            dom_selectors: HashMap::new(),
         };
 
         analyzer.compile_patterns()?;
         analyzer.compile_version_patches()?;
+        analyzer.build_implies_graph();
         Ok(analyzer)
+    }
+
+    /// Extract CSS selector strings from a Wappalyzer `dom` field value.
+    /// Handles String, Array, and Object (keys-as-selectors) shapes.
+    fn extract_dom_selectors(val: &serde_json::Value) -> Vec<String> {
+        match val {
+            serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+            serde_json::Value::Array(arr) => arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+            serde_json::Value::Object(map) => map.keys()
+                .filter(|k| !k.is_empty())
+                .cloned()
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Build the implies graph by parsing all `implies` fields in the database once.
+    /// Called after `compile_patterns()` and `compile_version_patches()` in `new()`.
+    fn build_implies_graph(&mut self) {
+        for (tech_name, tech_def) in &self.database.technologies {
+            if let Some(implies) = &tech_def.implies {
+                let implied_list: Vec<String> = match implies {
+                    Value::String(s) => vec![s.clone()],
+                    Value::Array(arr) => arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut entries: Vec<ImpliedTech> = Vec::new();
+                for implied in implied_list {
+                    let parts: Vec<&str> = implied.split("\\;").collect();
+                    let name = parts[0].trim().to_string();
+                    if name.is_empty() { continue; }
+                    let version = parts.iter().skip(1)
+                        .find(|p| p.starts_with("version:"))
+                        .and_then(|p| p.strip_prefix("version:"))
+                        .map(|v| v.to_string())
+                        .filter(|v| !v.is_empty());
+                    let weight = parts.iter().skip(1)
+                        .find(|p| p.starts_with("confidence:"))
+                        .and_then(|p| p.strip_prefix("confidence:"))
+                        .and_then(|v| v.parse::<u8>().ok())
+                        .unwrap_or(100);
+                    entries.push(ImpliedTech { name, weight, version });
+                }
+                if !entries.is_empty() {
+                    self.implies_graph.insert(tech_name.clone(), entries);
+                }
+            }
+        }
     }
 
     /// Look up canonical tech name by case-insensitive string
@@ -113,7 +175,7 @@ impl TechnologyAnalyzer {
         for (tech_name, tech_def) in &self.database.technologies {
             // Compile HTML patterns
             if let Some(html_patterns) = &tech_def.html {
-                if let Ok(patterns) = Self::compile_pattern_value(html_patterns) {
+                if let Ok(patterns) = Self::compile_pattern_value(html_patterns, "html") {
                     if !patterns.is_empty() {
                         self.html_patterns.insert(tech_name.clone(), patterns);
                     }
@@ -122,7 +184,7 @@ impl TechnologyAnalyzer {
 
             // Compile URL patterns
             if let Some(url_patterns) = &tech_def.url {
-                if let Ok(patterns) = Self::compile_pattern_value(url_patterns) {
+                if let Ok(patterns) = Self::compile_pattern_value(url_patterns, "url") {
                     if !patterns.is_empty() {
                         self.url_patterns.insert(tech_name.clone(), patterns);
                     }
@@ -131,14 +193,14 @@ impl TechnologyAnalyzer {
 
             // Compile script src patterns (both `script` and `scriptSrc` fields map here)
             if let Some(script_patterns) = &tech_def.script {
-                if let Ok(patterns) = Self::compile_pattern_value(script_patterns) {
+                if let Ok(patterns) = Self::compile_pattern_value(script_patterns, "script") {
                     if !patterns.is_empty() {
                         self.script_patterns.entry(tech_name.clone()).or_default().extend(patterns);
                     }
                 }
             }
             if let Some(script_src_patterns) = &tech_def.script_src {
-                if let Ok(patterns) = Self::compile_pattern_value(script_src_patterns) {
+                if let Ok(patterns) = Self::compile_pattern_value(script_src_patterns, "script_src") {
                     if !patterns.is_empty() {
                         self.script_patterns.entry(tech_name.clone()).or_default().extend(patterns);
                     }
@@ -147,7 +209,7 @@ impl TechnologyAnalyzer {
 
             // Compile inline script content patterns (`scripts` field)
             if let Some(inline_scripts) = &tech_def.scripts {
-                if let Ok(patterns) = Self::compile_pattern_value(inline_scripts) {
+                if let Ok(patterns) = Self::compile_pattern_value(inline_scripts, "scripts") {
                     if !patterns.is_empty() {
                         self.inline_script_patterns.insert(tech_name.clone(), patterns);
                     }
@@ -158,7 +220,7 @@ impl TechnologyAnalyzer {
             if let Some(headers) = &tech_def.headers {
                 let mut compiled_headers = HashMap::new();
                 for (header_name, pattern_value) in headers {
-                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value) {
+                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value, "header") {
                         if !patterns.is_empty() {
                             compiled_headers.insert(header_name.to_lowercase(), patterns);
                         }
@@ -173,7 +235,7 @@ impl TechnologyAnalyzer {
             if let Some(meta) = &tech_def.meta {
                 let mut compiled_meta = HashMap::new();
                 for (meta_name, pattern_value) in meta {
-                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value) {
+                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value, "meta") {
                         if !patterns.is_empty() {
                             compiled_meta.insert(meta_name.to_lowercase(), patterns);
                         }
@@ -186,7 +248,7 @@ impl TechnologyAnalyzer {
 
             // Compile CSS patterns
             if let Some(css_value) = &tech_def.css {
-                if let Ok(patterns) = Self::compile_pattern_value(css_value) {
+                if let Ok(patterns) = Self::compile_pattern_value(css_value, "css") {
                     if !patterns.is_empty() {
                         self.css_patterns.insert(tech_name.clone(), patterns);
                     }
@@ -197,7 +259,7 @@ impl TechnologyAnalyzer {
             if let Some(cookies) = &tech_def.cookies {
                 let mut compiled_cookies = HashMap::new();
                 for (cookie_name, pattern_value) in cookies {
-                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value) {
+                    if let Ok(patterns) = Self::compile_pattern_value(pattern_value, "cookie") {
                         if !patterns.is_empty() {
                             compiled_cookies.insert(cookie_name.to_lowercase(), patterns);
                         }
@@ -231,6 +293,16 @@ impl TechnologyAnalyzer {
             }
 
             if let Some(ref p) = pb { p.inc(1); }
+        }
+
+        // Compile DOM selectors from the `dom` field
+        for (tech_name, tech_def) in &self.database.technologies {
+            if let Some(dom_val) = &tech_def.dom {
+                let selectors = Self::extract_dom_selectors(dom_val);
+                if !selectors.is_empty() {
+                    self.dom_selectors.insert(tech_name.clone(), selectors);
+                }
+            }
         }
 
         // Compile DNS patterns (pre-compiled regexes for domain-aware matching)
@@ -284,7 +356,7 @@ impl TechnologyAnalyzer {
                         if let Some(obj) = value.as_object() {
                             let entry = self.header_patterns.entry(tech_name.clone()).or_default();
                             for (hname, hpat) in obj {
-                                if let Ok(patterns) = Self::compile_pattern_value(hpat) {
+                                if let Ok(patterns) = Self::compile_pattern_value(hpat, "header") {
                                     entry.insert(hname.to_lowercase(), patterns);
                                 }
                             }
@@ -294,14 +366,14 @@ impl TechnologyAnalyzer {
                         if let Some(obj) = value.as_object() {
                             let entry = self.meta_patterns.entry(tech_name.clone()).or_default();
                             for (mname, mpat) in obj {
-                                if let Ok(patterns) = Self::compile_pattern_value(mpat) {
+                                if let Ok(patterns) = Self::compile_pattern_value(mpat, "meta") {
                                     entry.insert(mname.to_lowercase(), patterns);
                                 }
                             }
                         }
                     }
                     "html" => {
-                        if let Ok(patterns) = Self::compile_pattern_value(value) {
+                        if let Ok(patterns) = Self::compile_pattern_value(value, "html") {
                             self.html_patterns.entry(tech_name.clone()).or_default().extend(patterns);
                         }
                     }
@@ -309,7 +381,7 @@ impl TechnologyAnalyzer {
                         if let Some(obj) = value.as_object() {
                             let entry = self.cookie_patterns.entry(tech_name.clone()).or_default();
                             for (cname, cpat) in obj {
-                                if let Ok(patterns) = Self::compile_pattern_value(cpat) {
+                                if let Ok(patterns) = Self::compile_pattern_value(cpat, "cookie") {
                                     entry.insert(cname.to_lowercase(), patterns);
                                 }
                             }
@@ -341,20 +413,21 @@ impl TechnologyAnalyzer {
         Ok(())
     }
 
-    /// Compile a pattern value (string or array) into CompiledPattern structs
-    fn compile_pattern_value(value: &Value) -> Result<Vec<CompiledPattern>, WappalyzerError> {
+    /// Compile a pattern value (string or array) into CompiledPattern structs.
+    /// `field_type` controls how empty patterns are handled — see `compile_single_pattern`.
+    fn compile_pattern_value(value: &Value, field_type: &str) -> Result<Vec<CompiledPattern>, WappalyzerError> {
         let mut patterns = Vec::new();
 
         match value {
             Value::String(pattern_str) => {
-                if let Some(compiled) = Self::compile_single_pattern(pattern_str)? {
+                if let Some(compiled) = Self::compile_single_pattern_typed(pattern_str, field_type)? {
                     patterns.push(compiled);
                 }
             }
             Value::Array(pattern_array) => {
                 for pattern_val in pattern_array {
                     if let Value::String(pattern_str) = pattern_val {
-                        if let Some(compiled) = Self::compile_single_pattern(pattern_str)? {
+                        if let Some(compiled) = Self::compile_single_pattern_typed(pattern_str, field_type)? {
                             patterns.push(compiled);
                         }
                     }
@@ -366,7 +439,29 @@ impl TechnologyAnalyzer {
         Ok(patterns)
     }
 
-    /// Compile a single pattern string with confidence and version extraction
+    /// Field-type-aware wrapper around `compile_single_pattern`.
+    ///
+    /// For content fields (`html`, `script`, `script_src`, `scripts`, `css`, `url`) an empty
+    /// pattern means "no match pattern defined" — return `Ok(None)` so the tech is not added
+    /// to the compiled map at all, preventing spurious catch-all detections.
+    ///
+    /// For presence-only fields (`header`, `cookie`, `meta`) an empty pattern means "match if
+    /// the field exists", so we fall through to `compile_single_pattern` which returns `.*`.
+    fn compile_single_pattern_typed(pattern: &str, field_type: &str) -> Result<Option<CompiledPattern>, WappalyzerError> {
+        if pattern.is_empty() {
+            match field_type {
+                "html" | "script" | "script_src" | "scripts" | "css" | "url" => {
+                    return Ok(None);
+                }
+                _ => {} // header, cookie, meta — fall through to presence-only `.*`
+            }
+        }
+        Self::compile_single_pattern(pattern)
+    }
+
+    /// Compile a single pattern string with confidence and version extraction.
+    /// Empty pattern → presence-only catch-all `.*` with confidence 100.
+    /// Callers that need field-type-aware behaviour should use `compile_single_pattern_typed`.
     pub fn compile_single_pattern(pattern: &str) -> Result<Option<CompiledPattern>, WappalyzerError> {
         if pattern.is_empty() {
             // Empty pattern = presence-only detection (header/cookie just needs to exist)
@@ -451,41 +546,25 @@ impl TechnologyAnalyzer {
         // Generic cookie heuristics: framework/platform cookies not covered by DB
         self.scan_cookie_generic(response, &mut detected_technologies);
 
-        // Apply "implies" logic using a workqueue (O(n) instead of O(n²))
+        // DOM selector matching: CSS selectors from the Wappalyzer `dom` field
+        self.analyze_dom(&response.body, &mut detected_technologies);
+
+        // Apply "implies" logic using pre-computed graph (avoids repeated string parsing)
         let mut queue: std::collections::VecDeque<String> =
             detected_technologies.keys().cloned().collect();
         while let Some(tech_name) = queue.pop_front() {
-            if let Some(tech_def) = self.database.technologies.get(&tech_name) {
-                if let Some(implies) = &tech_def.implies {
-                    let implied_list: Vec<String> = match implies {
-                        Value::String(s) => vec![s.clone()],
-                        Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
-                        _ => Vec::new(),
-                    };
-                    for implied in implied_list {
-                        let parts: Vec<&str> = implied.split("\\;").collect();
-                        let implied_name = parts[0].trim().to_string();
-                        let implied_version = parts.iter().skip(1)
-                            .find(|p| p.starts_with("version:"))
-                            .and_then(|p| p.strip_prefix("version:"))
-                            .map(|v| v.to_string())
-                            .filter(|v| !v.is_empty());
-                        let implied_weight = parts.iter().skip(1)
-                            .find(|p| p.starts_with("confidence:"))
-                            .and_then(|p| p.strip_prefix("confidence:"))
-                            .and_then(|v| v.parse::<u8>().ok())
-                            .unwrap_or(100);
-                        if !detected_technologies.contains_key(&implied_name) {
-                            Self::update_detection(
-                                &mut detected_technologies,
-                                &implied_name,
-                                "implied",
-                                &tech_name,
-                                implied_weight,
-                                implied_version,
-                            );
-                            queue.push_back(implied_name);
-                        }
+            if let Some(implied_list) = self.implies_graph.get(&tech_name) {
+                for implied in implied_list {
+                    if !detected_technologies.contains_key(&implied.name) {
+                        Self::update_detection(
+                            &mut detected_technologies,
+                            &implied.name,
+                            "implied",
+                            &tech_name,
+                            implied.weight,
+                            implied.version.clone(),
+                        );
+                        queue.push_back(implied.name.clone());
                     }
                 }
             }
@@ -757,7 +836,8 @@ impl TechnologyAnalyzer {
             ))
             .collect();
         Self::apply_exclusions_and_requirements(&mut detected, &self.database);
-        technologies.retain(|t| detected.contains_key(&t.name));
+        let valid: std::collections::HashSet<String> = detected.into_keys().collect();
+        technologies.retain(|t| valid.contains(&t.name));
     }
 }
 

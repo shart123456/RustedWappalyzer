@@ -64,6 +64,9 @@ tracing-actix-web = "0.7"
 # Async utilities
 futures = "0.3"
 
+# DOM selector matching (for Wappalyzer `dom` field)
+scraper = "0.20"
+
 # Parallel processing
 rayon = "1.0"
 
