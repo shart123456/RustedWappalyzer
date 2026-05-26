@@ -8,3 +8,4 @@ pub(crate) mod cookies;
 pub(crate) mod csp;
 pub(crate) mod dns;
 pub(crate) mod probes;
+pub(crate) mod dom;
