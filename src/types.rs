@@ -148,6 +148,28 @@ pub struct CompiledJsPattern {
     pub pattern: Option<CompiledPattern>,
 }
 
+/// A compiled DOM detection rule from the Wappalyzer `dom` field.
+///
+/// A rule matches only when an element matching `selector` also satisfies every
+/// attribute condition and the text condition (if present). Rules whose only
+/// condition is a runtime JS `properties` check are not representable here —
+/// they are dropped at compile time because they cannot be evaluated against
+/// static HTML (matching them on the selector alone caused mass false positives).
+#[derive(Debug, Clone)]
+pub struct CompiledDomRule {
+    /// CSS selector locating candidate elements.
+    pub selector: String,
+    /// Attribute conditions: (lowercased attribute name, optional value pattern).
+    /// A `None` pattern means the attribute need only be present.
+    /// All conditions must hold on the same element.
+    pub attributes: Vec<(String, Option<CompiledPattern>)>,
+    /// Optional text-content pattern the matched element must satisfy.
+    pub text: Option<CompiledPattern>,
+    /// True when mere existence of a matching element satisfies the rule
+    /// (bare string/array selector form, or an explicit `exists` key).
+    pub exists: bool,
+}
+
 /// Technology definition from Wappalyzer database
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TechnologyDefinition {

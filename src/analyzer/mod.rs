@@ -107,8 +107,11 @@ pub struct TechnologyAnalyzer {
     /// Pre-parsed implies graph: tech name → list of implied techs with weight/version.
     /// Built once at startup; used in `analyze()` to avoid repeated string parsing.
     pub(crate) implies_graph: HashMap<String, Vec<ImpliedTech>>,
-    /// CSS selectors extracted from the `dom` field: tech name → list of selector strings.
-    pub(crate) dom_selectors: HashMap<String, Vec<String>>,
+    /// Compiled DOM rules from the `dom` field: tech name → list of rules.
+    /// Each rule carries the selector plus its attribute/text conditions, so a
+    /// detection only fires when the conditions actually hold (not on selector
+    /// presence alone).
+    pub(crate) dom_rules: HashMap<String, Vec<CompiledDomRule>>,
 }
 
 impl TechnologyAnalyzer {
@@ -142,7 +145,7 @@ impl TechnologyAnalyzer {
             cpe_overrides,
             version_patches,
             implies_graph: HashMap::new(),
-            dom_selectors: HashMap::new(),
+            dom_rules: HashMap::new(),
         };
 
         analyzer.compile_patterns()?;
@@ -151,21 +154,77 @@ impl TechnologyAnalyzer {
         Ok(analyzer)
     }
 
-    /// Extract CSS selector strings from a Wappalyzer `dom` field value.
-    /// Handles String, Array, and Object (keys-as-selectors) shapes.
-    fn extract_dom_selectors(val: &serde_json::Value) -> Vec<String> {
+    /// Compile a Wappalyzer `dom` field value into [`CompiledDomRule`]s.
+    ///
+    /// Handles the three shapes:
+    /// - String  `"selector"`            → an exists rule.
+    /// - Array   `["s1","s2"]`           → one exists rule per selector.
+    /// - Object  `{"sel": {conditions}}` → a rule per selector with its
+    ///   `exists` / `attributes` / `text` conditions compiled. `properties`
+    ///   (runtime JS object props) are not observable in static HTML, so a rule
+    ///   whose only condition is `properties` is dropped — matching it on the
+    ///   selector alone is what produced mass false positives.
+    fn compile_dom_rules(val: &serde_json::Value) -> Vec<CompiledDomRule> {
+        fn exists_rule(selector: &str) -> Option<CompiledDomRule> {
+            if selector.is_empty() { return None; }
+            Some(CompiledDomRule {
+                selector: selector.to_string(),
+                attributes: Vec::new(),
+                text: None,
+                exists: true,
+            })
+        }
+
         match val {
-            serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+            serde_json::Value::String(s) => exists_rule(s).into_iter().collect(),
             serde_json::Value::Array(arr) => arr.iter()
                 .filter_map(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
+                .filter_map(exists_rule)
                 .collect(),
-            serde_json::Value::Object(map) => map.keys()
-                .filter(|k| !k.is_empty())
-                .cloned()
-                .collect(),
-            _ => vec![],
+            serde_json::Value::Object(map) => {
+                let mut rules = Vec::new();
+                for (selector, cond) in map {
+                    if selector.is_empty() { continue; }
+                    // Non-object condition value → treat as bare existence.
+                    let Some(cond_obj) = cond.as_object() else {
+                        if let Some(r) = exists_rule(selector) { rules.push(r); }
+                        continue;
+                    };
+
+                    let exists = cond_obj.contains_key("exists");
+
+                    let mut attributes: Vec<(String, Option<CompiledPattern>)> = Vec::new();
+                    if let Some(attrs) = cond_obj.get("attributes").and_then(|a| a.as_object()) {
+                        for (name, pat) in attrs {
+                            let pat_str = pat.as_str().unwrap_or("");
+                            let compiled = if pat_str.is_empty() {
+                                None // presence-only
+                            } else {
+                                match Self::compile_single_pattern(pat_str) {
+                                    Ok(cp) => cp,
+                                    Err(_) => None,
+                                }
+                            };
+                            attributes.push((name.to_ascii_lowercase(), compiled));
+                        }
+                    }
+
+                    let text = cond_obj.get("text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| Self::compile_single_pattern(s).ok().flatten());
+
+                    // Drop rules with no statically-checkable condition
+                    // (e.g. `properties`-only React/Preact rules).
+                    if !exists && attributes.is_empty() && text.is_none() {
+                        continue;
+                    }
+
+                    rules.push(CompiledDomRule { selector: selector.clone(), attributes, text, exists });
+                }
+                rules
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -358,12 +417,12 @@ impl TechnologyAnalyzer {
             if let Some(ref p) = pb { p.inc(1); }
         }
 
-        // Compile DOM selectors from the `dom` field
+        // Compile DOM rules (selector + conditions) from the `dom` field
         for (tech_name, tech_def) in &self.database.technologies {
             if let Some(dom_val) = &tech_def.dom {
-                let selectors = Self::extract_dom_selectors(dom_val);
-                if !selectors.is_empty() {
-                    self.dom_selectors.insert(tech_name.clone(), selectors);
+                let rules = Self::compile_dom_rules(dom_val);
+                if !rules.is_empty() {
+                    self.dom_rules.insert(tech_name.clone(), rules);
                 }
             }
         }
