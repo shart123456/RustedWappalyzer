@@ -16,6 +16,69 @@ use serde_json::Value;
 
 pub(crate) mod layers;
 
+/// Patterns from the Wappalyzer database that the `regex` crate cannot compile,
+/// recorded once each so startup does not emit the same warning repeatedly.
+///
+/// The dominant cause is look-around (`(?!`, `(?=`, `(?<`), which `regex` does not
+/// support by design. Each analyzer instance recompiles the whole database, so an
+/// unconditional `warn!` per failure produced the same handful of messages many
+/// times over and buried the rest of the startup log.
+static SKIPPED_PATTERNS: Lazy<std::sync::Mutex<HashMap<String, u32>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Record one pattern that failed to compile. Returns `true` if this is the first
+/// time this pattern has been seen (i.e. the caller should log it).
+fn record_skipped_pattern(pattern: &str) -> bool {
+    let mut guard = match SKIPPED_PATTERNS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let counter = guard.entry(pattern.to_string()).or_insert(0);
+    *counter += 1;
+    *counter == 1
+}
+
+/// Returns `(unique_patterns, total_occurrences)` for patterns skipped so far.
+pub fn skipped_pattern_stats() -> (usize, u32) {
+    let guard = match SKIPPED_PATTERNS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    (guard.len(), guard.values().sum())
+}
+
+/// The distinct patterns skipped so far, sorted for stable output.
+pub fn skipped_patterns() -> Vec<String> {
+    let guard = match SKIPPED_PATTERNS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut v: Vec<String> = guard.keys().cloned().collect();
+    v.sort();
+    v
+}
+
+/// Emit a single summary of database patterns that could not be compiled.
+///
+/// Called once after the database is loaded. Without this the gap is invisible:
+/// the per-pattern messages were the only signal, and they were both repetitive
+/// and easy to scroll past.
+pub fn log_skipped_pattern_summary() {
+    let (unique, total) = skipped_pattern_stats();
+    if unique == 0 {
+        return;
+    }
+    tracing::info!(
+        unique_patterns = unique,
+        total_occurrences = total,
+        "Some database patterns use unsupported regex features (look-around) and were skipped; \
+         affected technologies fall back to their remaining patterns"
+    );
+    for pattern in skipped_patterns() {
+        tracing::debug!(pattern = %pattern, "Skipped database pattern");
+    }
+}
+
 pub struct TechnologyAnalyzer {
     pub database: WappalyzerDatabase,
     pub(crate) html_patterns: HashMap<String, Vec<CompiledPattern>>,
@@ -498,7 +561,16 @@ impl TechnologyAnalyzer {
                 version,
             })),
             Err(e) => {
-                tracing::warn!("Invalid regex pattern in Wappalyzer database (skipping): {}", e);
+                // Log each distinct pattern once. Every analyzer instance
+                // recompiles the database, so an unconditional warn! here
+                // repeated the same messages and drowned the startup log.
+                if record_skipped_pattern(regex_pattern) {
+                    tracing::warn!(
+                        pattern = %regex_pattern,
+                        error = %e,
+                        "Skipping database pattern that the regex crate cannot compile"
+                    );
+                }
                 Ok(None)
             }
         }
@@ -1019,5 +1091,39 @@ mod favicon {
     pub fn hash_favicon(bytes: &[u8]) -> i32 {
         let encoded = base64_encodebytes(bytes);
         mmh3_x86_32(encoded.as_bytes(), 0)
+    }
+}
+
+#[cfg(test)]
+mod skipped_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn look_around_patterns_are_skipped_not_fatal() {
+        // Representative of the shapes actually present in the database.
+        for pat in [
+            r"^(?!.*player).*aniview\.com/",
+            r"<(?!svg)[^>]+\sdata-v(?:ue)?-",
+            r"\b(?<!-)UPS\b",
+        ] {
+            let out = TechnologyAnalyzer::compile_single_pattern(pat);
+            assert!(out.is_ok(), "compilation must not error for {pat}");
+            assert!(out.unwrap().is_none(), "{pat} should be skipped");
+        }
+    }
+
+    #[test]
+    fn recording_is_deduplicated_per_pattern() {
+        let unique_pat = "test-only-pattern-(?!dedupe-probe)";
+        assert!(record_skipped_pattern(unique_pat), "first sighting logs");
+        assert!(!record_skipped_pattern(unique_pat), "second does not");
+        assert!(!record_skipped_pattern(unique_pat), "third does not");
+        assert!(skipped_patterns().iter().any(|p| p == unique_pat));
+    }
+
+    #[test]
+    fn valid_patterns_still_compile() {
+        let out = TechnologyAnalyzer::compile_single_pattern(r"nginx/([\d.]+)").unwrap();
+        assert!(out.is_some());
     }
 }
