@@ -100,9 +100,60 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
         600,  // hot window: 10 minutes of inactivity before eviction
     ));
 
+    let state = AppState {
+        analyzer: data,
+        insecure_flag,
+        vault: vault_data,
+        poc_vault: poc_vault_data,
+        alert_vault: alert_vault_data,
+        rate_limiter,
+        api_key: api_key_data,
+        insecure_analyzer: insecure_data,
+        response_cache,
+        hot_keys: hot_keys_data,
+    };
+
     actix_web::HttpServer::new(move || {
         actix_web::App::new()
             .wrap(tracing_actix_web::TracingLogger::default())
+            .configure(configure_app(state.clone()))
+    })
+    .bind(format!("0.0.0.0:{}", port))?
+    .run()
+    .await?;
+
+    Ok(())
+}
+
+/// Everything the HTTP layer needs, built once and shared by every worker.
+///
+/// Grouped into a struct so that [`configure_app`] is the single definition of
+/// how the API is wired. `run()` and the HTTP-layer tests both go through it,
+/// which is what keeps the tests honest: they exercise the same JSON config,
+/// the same routes and the same default service as production.
+#[derive(Clone)]
+pub(crate) struct AppState {
+    pub(crate) analyzer: actix_web::web::Data<Arc<StandaloneWappalyzer>>,
+    pub(crate) insecure_flag: actix_web::web::Data<bool>,
+    pub(crate) vault: actix_web::web::Data<Arc<Option<crate::vuln::VulnVault>>>,
+    pub(crate) poc_vault: actix_web::web::Data<Arc<Option<crate::poc::PocVault>>>,
+    pub(crate) alert_vault: actix_web::web::Data<Arc<Option<crate::alert::AlertVault>>>,
+    pub(crate) rate_limiter: actix_web::web::Data<crate::middleware::RateLimiter>,
+    pub(crate) api_key: actix_web::web::Data<Option<String>>,
+    pub(crate) insecure_analyzer: actix_web::web::Data<Arc<Option<StandaloneWappalyzer>>>,
+    pub(crate) response_cache:
+        actix_web::web::Data<Arc<moka::sync::Cache<String, Arc<AnalysisResult>>>>,
+    pub(crate) hot_keys: actix_web::web::Data<cache::HotKeys>,
+}
+
+/// Register shared state, the JSON body config, the routes and the fallback
+/// service. Returns a closure so it can be passed straight to
+/// `App::configure`.
+pub(crate) fn configure_app(
+    state: AppState,
+) -> impl FnOnce(&mut actix_web::web::ServiceConfig) {
+    move |cfg: &mut actix_web::web::ServiceConfig| {
+        cfg
             // 64 KB max body. The error_handler keeps malformed-body rejections
             // in the same {"error": ...} envelope as every other failure; by
             // default actix returns them as bare text, so clients had to parse
@@ -120,16 +171,16 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
                         .into()
                     }),
             )
-            .app_data(data.clone())
-            .app_data(insecure_flag.clone())
-            .app_data(vault_data.clone())
-            .app_data(poc_vault_data.clone())
-            .app_data(alert_vault_data.clone())
-            .app_data(rate_limiter.clone())
-            .app_data(api_key_data.clone())
-            .app_data(insecure_data.clone())
-            .app_data(response_cache.clone())
-            .app_data(hot_keys_data.clone())
+            .app_data(state.analyzer)
+            .app_data(state.insecure_flag)
+            .app_data(state.vault)
+            .app_data(state.poc_vault)
+            .app_data(state.alert_vault)
+            .app_data(state.rate_limiter)
+            .app_data(state.api_key)
+            .app_data(state.insecure_analyzer)
+            .app_data(state.response_cache)
+            .app_data(state.hot_keys)
             .route("/health", actix_web::web::get().to(handlers::health))
             .route("/info", actix_web::web::get().to(handlers::info))
             .route("/analyze", actix_web::web::post().to(handlers::analyze))
@@ -140,13 +191,8 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
             .default_service(actix_web::web::to(|| async {
                 actix_web::HttpResponse::NotFound()
                     .json(serde_json::json!({ "error": "Not found" }))
-            }))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await?;
-
-    Ok(())
+            }));
+    }
 }
 
 /// Build the request rate limiter from environment configuration.
@@ -172,4 +218,310 @@ fn build_rate_limiter() -> crate::middleware::RateLimiter {
         .unwrap_or(60);
     tracing::info!(max_reqs, window_secs, "In-process rate limiter enabled");
     RateLimiter::new(max_reqs, window_secs)
+}
+
+#[cfg(test)]
+mod http_tests {
+    //! HTTP-layer tests.
+    //!
+    //! These mount the real app through [`configure_app`], so the JSON body
+    //! config, the routes and the fallback service under test are the same ones
+    //! `run()` installs. Previously none of this layer had coverage: the error
+    //! envelopes and the rate-limit response were verified by hand only.
+    //!
+    //! Requests that reach a handler deliberately target a private address, so
+    //! the SSRF pre-flight rejects them with 400 and no traffic leaves the host.
+    //! A 400 therefore means "auth and rate limiting let this through", which is
+    //! what makes the status codes below meaningful.
+
+    use super::*;
+    use actix_web::{test, App};
+    use crate::middleware::RateLimiter;
+
+    /// One analyzer for the whole test binary — building it compiles every
+    /// database pattern, which is far too slow to repeat per test.
+    static ANALYZER: tokio::sync::OnceCell<Arc<StandaloneWappalyzer>> =
+        tokio::sync::OnceCell::const_new();
+
+    async fn analyzer() -> Arc<StandaloneWappalyzer> {
+        ANALYZER
+            .get_or_init(|| async {
+                let cfg = WappalyzerConfig {
+                    ssrf_protection: true,
+                    ..WappalyzerConfig::default()
+                };
+                Arc::new(
+                    StandaloneWappalyzer::with_config(false, cfg)
+                        .await
+                        .expect("build analyzer"),
+                )
+            })
+            .await
+            .clone()
+    }
+
+    /// Build app state with an overridable rate limiter and API key.
+    async fn state(rate_limiter: RateLimiter, api_key: Option<String>) -> AppState {
+        AppState {
+            analyzer: actix_web::web::Data::new(analyzer().await),
+            insecure_flag: actix_web::web::Data::new(false),
+            vault: actix_web::web::Data::new(Arc::new(None)),
+            poc_vault: actix_web::web::Data::new(Arc::new(None)),
+            alert_vault: actix_web::web::Data::new(Arc::new(None)),
+            rate_limiter: actix_web::web::Data::new(rate_limiter),
+            api_key: actix_web::web::Data::new(api_key),
+            insecure_analyzer: actix_web::web::Data::new(Arc::new(None)),
+            response_cache: actix_web::web::Data::new(Arc::new(
+                moka::sync::Cache::builder().max_capacity(16).build(),
+            )),
+            hot_keys: actix_web::web::Data::new(Arc::new(std::sync::Mutex::new(
+                HashMap::new(),
+            ))),
+        }
+    }
+
+    /// Default state: permissive limiter, no API key.
+    async fn default_state() -> AppState {
+        state(RateLimiter::new(600, 60), None).await
+    }
+
+    /// A URL the SSRF pre-flight always rejects, so handler tests stay offline.
+    const BLOCKED_URL: &str = r#"{"url":"http://10.0.0.1/"}"#;
+
+    #[actix_web::test]
+    async fn health_returns_ok() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/health").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[actix_web::test]
+    async fn info_reports_database_size() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(&app, test::TestRequest::get().uri("/info").to_request()).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["technologies"].as_u64().unwrap_or(0) > 0,
+            "expected a non-empty technology count, got {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn unknown_route_returns_json_envelope() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/no-such-route").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"], "Not found");
+    }
+
+    #[actix_web::test]
+    async fn wrong_method_returns_json_envelope() {
+        // GET on a POST-only route falls through to the default service.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/analyze").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"], "Not found");
+    }
+
+    #[actix_web::test]
+    async fn malformed_json_body_returns_error_envelope() {
+        // Regression guard for the JsonConfig error_handler: actix returns bare
+        // text for these by default, which forced clients to parse two shapes.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(r#"{"url":"#)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("Json deserialize error"),
+            "expected a JSON envelope carrying the parse detail, got {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn missing_required_field_returns_error_envelope() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .set_payload("{}")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("missing field"),
+            "expected the missing-field detail inside the envelope, got {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn rate_limit_triggers_at_the_configured_value() {
+        // Regression guard for the 429 body, which used to hardcode
+        // "Max 600 requests per minute" regardless of configuration.
+        let app = test::init_service(
+            App::new().configure(configure_app(state(RateLimiter::new(2, 60), None).await)),
+        )
+        .await;
+
+        let send = || {
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(BLOCKED_URL)
+                .to_request()
+        };
+
+        // Two allowed: 400 from the SSRF pre-flight means the limiter passed.
+        assert_eq!(test::call_service(&app, send()).await.status(), 400);
+        assert_eq!(test::call_service(&app, send()).await.status(), 400);
+
+        let limited = test::call_service(&app, send()).await;
+        assert_eq!(limited.status(), 429);
+        let body: serde_json::Value = test::read_body_json(limited).await;
+        assert_eq!(
+            body["error"], "Rate limit exceeded. Max 2 requests per 60 seconds.",
+            "the 429 body must report the configured limit, not a fixed one"
+        );
+    }
+
+    #[actix_web::test]
+    async fn disabled_rate_limiter_never_returns_429() {
+        let app = test::init_service(
+            App::new().configure(configure_app(state(RateLimiter::disabled(), None).await)),
+        )
+        .await;
+        for i in 0..12 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/analyze")
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(BLOCKED_URL)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 400, "request {i} should not be rate-limited");
+        }
+    }
+
+    #[actix_web::test]
+    async fn api_key_is_required_when_configured() {
+        let app = test::init_service(
+            App::new().configure(
+                configure_app(state(RateLimiter::new(600, 60), Some("s3cret".into())).await),
+            ),
+        )
+        .await;
+
+        let no_key = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(BLOCKED_URL)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(no_key.status(), 401);
+        let body: serde_json::Value = test::read_body_json(no_key).await;
+        assert_eq!(body["error"], "Invalid or missing API key");
+
+        let wrong_key = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .insert_header(("authorization", "Bearer wrong"))
+                .set_payload(BLOCKED_URL)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(wrong_key.status(), 401);
+
+        // Correct key: reaches the handler, then the SSRF pre-flight rejects it.
+        let good_key = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze")
+                .insert_header(("content-type", "application/json"))
+                .insert_header(("authorization", "Bearer s3cret"))
+                .set_payload(BLOCKED_URL)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(good_key.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn ssrf_preflight_rejects_private_targets_through_the_api() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        for url in [
+            "http://127.0.0.1:80/",
+            "http://0.0.0.0:80/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/",
+            "http://[::1]:80/",
+        ] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/analyze")
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(format!(r#"{{"url":"{url}"}}"#))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 400, "{url} must be rejected");
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains("private/internal"),
+                "{url} should report a private-address rejection, got {body}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn non_http_scheme_is_rejected() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        for url in ["file:///etc/passwd", "gopher://127.0.0.1/", "not-a-url"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/analyze")
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(format!(r#"{{"url":"{url}"}}"#))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 400, "{url} must be rejected");
+        }
+    }
 }

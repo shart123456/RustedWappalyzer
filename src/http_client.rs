@@ -80,6 +80,33 @@ pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Keep only the resolved addresses that are safe to dial, erroring when none
+/// are left.
+///
+/// Split out from [`SsrfDnsResolver::resolve`] so the decision can be tested
+/// without performing a DNS lookup. Filtering rather than rejecting outright is
+/// deliberate: a hostname that resolves to both a public and a private address
+/// must still be reachable on the public one, while the private address must
+/// never be dialled.
+fn filter_dialable_addrs(
+    host: &str,
+    addrs: impl Iterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let safe: Vec<SocketAddr> = addrs.filter(|addr| !is_private_ip(addr.ip())).collect();
+
+    if safe.is_empty() {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "SSRF blocked: '{}' resolves only to private/internal addresses",
+                host
+            ),
+        )) as Box<dyn std::error::Error + Send + Sync>);
+    }
+
+    Ok(safe)
+}
+
 /// Custom DNS resolver that validates resolved addresses against the SSRF
 /// blocklist **at connection time**.
 ///
@@ -112,20 +139,7 @@ impl Resolve for SsrfDnsResolver {
                 }
             };
 
-            let safe: Vec<SocketAddr> = addrs
-                .filter(|addr| !is_private_ip(addr.ip()))
-                .collect();
-
-            if safe.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "SSRF blocked: '{}' resolves only to private/internal addresses",
-                        host
-                    ),
-                )) as Box<dyn std::error::Error + Send + Sync>);
-            }
-
+            let safe = filter_dialable_addrs(&host, addrs)?;
             Ok(Box::new(safe.into_iter()) as Addrs)
         })
     }
@@ -308,5 +322,145 @@ mod tests {
                   "93.184.216.34", "2606:4700:4700::1111"] {
             assert!(!is_private_ip(ip(s)), "{s} should be public");
         }
+    }
+}
+
+#[cfg(test)]
+mod rebinding_tests {
+    //! Coverage for the connect-time SSRF check -- the DNS-rebinding
+    //! mitigation. Before these tests the hook had none, despite being the
+    //! layer that is supposed to hold when the `is_safe_url()` pre-flight is
+    //! defeated by a hostname that resolves differently on the second lookup.
+
+    use super::*;
+    use crate::types::WappalyzerConfig;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn sa(s: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(s.parse::<IpAddr>().unwrap(), port)
+    }
+
+    #[test]
+    fn all_private_addresses_are_refused() {
+        // The rebinding case: the second lookup returns only private space.
+        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0", "100.64.0.1"] {
+            let err = filter_dialable_addrs("evil.example", [sa(ip, 80)].into_iter())
+                .expect_err(&format!("{ip} must be refused"));
+            assert!(
+                err.to_string().contains("SSRF blocked"),
+                "unexpected error for {ip}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_addresses_are_stripped_from_a_mixed_answer() {
+        // A hostname answering with both a public and a private address must
+        // stay reachable on the public one, with the private one unusable --
+        // returning the whole set would leave the private address dialable.
+        let public = sa("93.184.216.34", 443);
+        let out = filter_dialable_addrs(
+            "mixed.example",
+            [sa("127.0.0.1", 443), public, sa("10.1.2.3", 443)].into_iter(),
+        )
+        .expect("public address should survive");
+        assert_eq!(out, vec![public]);
+    }
+
+    #[test]
+    fn public_addresses_pass_through_unchanged() {
+        let addrs = vec![sa("8.8.8.8", 53), sa("1.1.1.1", 53), sa("2606:4700:4700::1111", 443)];
+        let out = filter_dialable_addrs("ok.example", addrs.clone().into_iter()).unwrap();
+        assert_eq!(out, addrs);
+    }
+
+    #[test]
+    fn an_empty_answer_is_refused() {
+        let err = filter_dialable_addrs("nx.example", std::iter::empty())
+            .expect_err("empty answer must not be dialable");
+        assert!(err.to_string().contains("SSRF blocked"));
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_refused() {
+        // ::ffff:127.0.0.1 reaches loopback while looking like a v6 address.
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()),
+            80,
+        );
+        assert!(filter_dialable_addrs("mapped.example", [mapped].into_iter()).is_err());
+        assert!(filter_dialable_addrs(
+            "unspec.example",
+            [SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 80)].into_iter()
+        )
+        .is_err());
+    }
+
+    /// End-to-end proof that the hook fires on a real connection attempt, with
+    /// no pre-flight involved.
+    ///
+    /// A local listener is reachable via `http://localhost:<port>`, which forces
+    /// reqwest through the custom resolver (an IP-literal URL would skip DNS
+    /// entirely and prove nothing). The unprotected client is the control: it
+    /// must succeed against the same URL, so a failure in the protected case
+    /// can only come from the resolver.
+    #[tokio::test]
+    async fn resolver_blocks_loopback_on_a_real_connect_with_no_preflight() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<html></html>",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let url = format!("http://localhost:{port}/");
+
+        // Control: protection off -> the fetch works, so the target is live and
+        // `localhost` resolves as expected on this host.
+        let open = HttpClient::new_with_config(
+            false,
+            &WappalyzerConfig { ssrf_protection: false, ..WappalyzerConfig::default() },
+        )
+        .unwrap();
+        let allowed = fetch_with_client(&open.client, &url).await;
+        assert!(
+            allowed.is_ok(),
+            "control fetch should succeed, got {:?}",
+            allowed.err().map(|e| e.to_string())
+        );
+
+        // Protected: the same URL must be refused at connect time.
+        let guarded = HttpClient::new_with_config(
+            false,
+            &WappalyzerConfig { ssrf_protection: true, ..WappalyzerConfig::default() },
+        )
+        .unwrap();
+        let blocked = fetch_with_client(&guarded.client, &url).await;
+        let err = blocked.expect_err("ssrf_protection must refuse a hostname resolving to loopback");
+        // The resolver's error is wrapped by reqwest and again by
+        // WappalyzerError, so the top-level message is only "error sending
+        // request". Walk the source chain to confirm the refusal actually came
+        // from the SSRF check -- asserting on is_err() alone would also pass for
+        // an unrelated connection failure.
+        let mut chain = err.to_string();
+        let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
+        while let Some(e) = src {
+            chain.push_str(" | ");
+            chain.push_str(&e.to_string());
+            src = e.source();
+        }
+        assert!(
+            chain.contains("SSRF blocked"),
+            "the refusal must originate in the SSRF resolver, not an unrelated \
+             connection failure; error chain was: {chain}"
+        );
     }
 }
