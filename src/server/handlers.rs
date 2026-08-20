@@ -160,8 +160,15 @@ fn check_auth_and_rate_limit(
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     if !rate_limiter.check(&ip) {
+        // Report the configured limit rather than a hardcoded one: the values
+        // are settable via RATE_LIMIT_MAX_REQS / RATE_LIMIT_WINDOW_SECS, so a
+        // fixed string is wrong for any non-default deployment.
         return Err(HttpResponse::TooManyRequests().json(serde_json::json!({
-            "error": "Rate limit exceeded. Max 600 requests per minute."
+            "error": format!(
+                "Rate limit exceeded. Max {} requests per {} seconds.",
+                rate_limiter.max_requests(),
+                rate_limiter.window_secs()
+            )
         })));
     }
     if let Some(required_key) = api_key.as_deref() {
