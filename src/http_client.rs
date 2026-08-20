@@ -16,55 +16,66 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// domains" so batch scans fail those URLs fast.
 const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Returns `true` if the address falls within a private, loopback, link-local,
-/// or ULA range that should never be reachable from a public HTTP scanner.
+/// Returns `true` if an IPv4 address (as octets) falls in a range that must
+/// never be reachable from a public HTTP scanner. Shared by the IPv4 arm and
+/// the IPv4-mapped-IPv6 arm of [`is_private_ip`] so the two can't drift.
 ///
 /// Checked ranges:
-/// - IPv4 loopback      127.0.0.0/8
-/// - IPv4 private       10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-/// - IPv4 link-local    169.254.0.0/16
-/// - IPv6 loopback      ::1
-/// - IPv6 link-local    fe80::/10
-/// - IPv6 ULA           fc00::/7
-/// - IPv4-mapped IPv6   ::ffff:x.x.x.x where x.x.x.x is in any of the above
+/// - `0.0.0.0/8`      "this network" / unspecified — `0.0.0.0` routes to
+///                    localhost on Linux, a classic SSRF bypass.
+/// - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`  RFC 1918 private
+/// - `100.64.0.0/10`  CGNAT (RFC 6598) — reachable inside many cloud networks
+/// - `127.0.0.0/8`    loopback
+/// - `169.254.0.0/16` link-local, incl. the cloud metadata IP 169.254.169.254
+fn is_private_v4(o: [u8; 4]) -> bool {
+    // 0.0.0.0/8
+    o[0] == 0
+    // 10.0.0.0/8
+    || o[0] == 10
+    // 127.0.0.0/8
+    || o[0] == 127
+    // 172.16.0.0/12
+    || (o[0] == 172 && (o[1] & 0xf0) == 16)
+    // 192.168.0.0/16
+    || (o[0] == 192 && o[1] == 168)
+    // 169.254.0.0/16 (link-local)
+    || (o[0] == 169 && o[1] == 254)
+    // 100.64.0.0/10 (CGNAT)
+    || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+}
+
+/// Returns `true` if the address falls within a private, loopback, link-local,
+/// unspecified, or ULA range that should never be reachable from a public HTTP
+/// scanner.
+///
+/// Covers all ranges in [`is_private_v4`] plus, for IPv6:
+/// - `::`            unspecified
+/// - `::1`           loopback
+/// - `fe80::/10`     link-local
+/// - `fc00::/7`      unique local (ULA)
+/// - `::ffff:x.x.x.x` IPv4-mapped — the embedded IPv4 is checked via [`is_private_v4`]
 pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // 127.0.0.0/8
-            o[0] == 127
-            // 10.0.0.0/8
-            || o[0] == 10
-            // 172.16.0.0/12
-            || (o[0] == 172 && (o[1] & 0xf0) == 16)
-            // 192.168.0.0/16
-            || (o[0] == 192 && o[1] == 168)
-            // 169.254.0.0/16 (link-local)
-            || (o[0] == 169 && o[1] == 254)
-        }
+        IpAddr::V4(v4) => is_private_v4(v4.octets()),
         IpAddr::V6(v6) => {
             let segs = v6.segments();
+            // :: unspecified
+            v6.is_unspecified()
             // ::1 loopback
-            v6.is_loopback()
+            || v6.is_loopback()
             // fe80::/10 link-local
             || (segs[0] & 0xffc0) == 0xfe80
             // fc00::/7 unique local (ULA)
             || (segs[0] & 0xfe00) == 0xfc00
             // ::ffff:0:0/96 — IPv4-mapped; check the embedded IPv4 address
             || (segs[0] == 0 && segs[1] == 0 && segs[2] == 0
-                && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff && {
-                    let o = [
-                        (segs[6] >> 8) as u8,
-                        segs[6] as u8,
-                        (segs[7] >> 8) as u8,
-                        segs[7] as u8,
-                    ];
-                    o[0] == 127
-                        || o[0] == 10
-                        || (o[0] == 172 && (o[1] & 0xf0) == 16)
-                        || (o[0] == 192 && o[1] == 168)
-                        || (o[0] == 169 && o[1] == 254)
-                })
+                && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff
+                && is_private_v4([
+                    (segs[6] >> 8) as u8,
+                    segs[6] as u8,
+                    (segs[7] >> 8) as u8,
+                    segs[7] as u8,
+                ]))
         }
     }
 }
@@ -255,4 +266,47 @@ pub async fn is_safe_url(url: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_private_ip;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn blocks_previously_missed_ranges() {
+        // 0.0.0.0/8 — routes to localhost on Linux (the gap this fix closes).
+        assert!(is_private_ip(ip("0.0.0.0")));
+        assert!(is_private_ip(ip("0.1.2.3")));
+        // IPv6 unspecified.
+        assert!(is_private_ip(ip("::")));
+        // CGNAT 100.64.0.0/10.
+        assert!(is_private_ip(ip("100.64.0.1")));
+        assert!(is_private_ip(ip("100.127.255.255")));
+        // IPv4-mapped forms of the above.
+        assert!(is_private_ip(ip("::ffff:0.0.0.0")));
+        assert!(is_private_ip(ip("::ffff:100.64.0.1")));
+    }
+
+    #[test]
+    fn still_blocks_classic_ranges() {
+        for s in ["127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1",
+                  "169.254.169.254", "::1", "fe80::1", "fc00::1",
+                  "::ffff:127.0.0.1"] {
+            assert!(is_private_ip(ip(s)), "{s} should be private");
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        // 100.0.0.0/8 outside CGNAT, and normal public v4/v6 must pass.
+        for s in ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1",
+                  "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(!is_private_ip(ip(s)), "{s} should be public");
+        }
+    }
 }
