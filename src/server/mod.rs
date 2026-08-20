@@ -97,7 +97,23 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     actix_web::HttpServer::new(move || {
         actix_web::App::new()
             .wrap(tracing_actix_web::TracingLogger::default())
-            .app_data(actix_web::web::JsonConfig::default().limit(65536)) // 64 KB max body
+            // 64 KB max body. The error_handler keeps malformed-body rejections
+            // in the same {"error": ...} envelope as every other failure; by
+            // default actix returns them as bare text, so clients had to parse
+            // two different shapes.
+            .app_data(
+                actix_web::web::JsonConfig::default()
+                    .limit(65536)
+                    .error_handler(|err, _req| {
+                        let detail = err.to_string();
+                        actix_web::error::InternalError::from_response(
+                            err,
+                            actix_web::HttpResponse::BadRequest()
+                                .json(serde_json::json!({ "error": detail })),
+                        )
+                        .into()
+                    }),
+            )
             .app_data(data.clone())
             .app_data(insecure_flag.clone())
             .app_data(vault_data.clone())
@@ -113,6 +129,12 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
             .route("/analyze", actix_web::web::post().to(handlers::analyze))
             .route("/batch", actix_web::web::post().to(handlers::batch))
             .route("/wayback", actix_web::web::post().to(handlers::wayback_analyze))
+            // Unknown route / wrong method: answer with the same JSON envelope
+            // rather than an empty body.
+            .default_service(actix_web::web::to(|| async {
+                actix_web::HttpResponse::NotFound()
+                    .json(serde_json::json!({ "error": "Not found" }))
+            }))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
