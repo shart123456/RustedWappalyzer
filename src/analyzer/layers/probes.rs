@@ -140,9 +140,19 @@ pub fn build_probe_list(origin: &str, technologies: &[Technology], full_scan: bo
     }
 
     // ── Python ───────────────────────────────────────────────────────────
-    if nothing || has_any(&["django", "flask", "fastapi", "python"]) {
-        add!("/static/admin/",   "django-admin");
-        add!("/admin/",          "generic-admin");
+    // Django emits no server header, no X-Powered-By and no framework-specific
+    // script URL, so it is never present in `technologies` when this list is
+    // built. Gating these probes on a prior Python/Django detection therefore
+    // made them unreachable on exactly the sites they exist to identify. Under
+    // full_scan we always probe; otherwise we keep the original gate so default
+    // scans do not grow.
+    if nothing || full_scan || has_any(&["django", "flask", "fastapi", "python"]) {
+        // A concrete file, not a directory: Django (and whitenoise, and any CDN
+        // in front of them) serves /static/admin/css/base.css but returns
+        // 404/403 for the /static/admin/ directory itself.
+        add!("/static/admin/css/base.css", "django-static");
+        add!("/admin/",                    "generic-admin");
+        add!("/admin/login/",              "django-admin");
     }
 
     // ── Go / Kubernetes ──────────────────────────────────────────────────
@@ -252,6 +262,8 @@ pub fn accepts_status_for_tag(tag: &str, status: u16) -> bool {
         "wp-admin" | "typo3-admin" | "django-admin" | "generic-admin" => {
             status == 200 || status == 301 || status == 302
         },
+        // Django's bundled admin stylesheet: only a 200 is meaningful.
+        "django-static" => status == 200,
         // Drupal core PHP: 403 forbidden still confirms Drupal is present
         "drupal-core-php" => status == 200 || status == 403,
         // wp-uploads: 403 (directory listing off) still confirms WP presence
@@ -923,6 +935,17 @@ impl TechnologyAnalyzer {
                         }
                     }
                 }
+                "django-static" => {
+                    // A 200 on /static/admin/css/base.css means Django's bundled
+                    // admin app is installed and its static files are collected.
+                    // Confirm it really is a stylesheet so a catch-all HTML 200
+                    // handler cannot masquerade as one.
+                    if body.contains("#header") || body.contains("django") || body.contains("body") {
+                        if let Some(tech) = find_tech("Django") {
+                            TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "django-static", 88, None);
+                        }
+                    }
+                }
                 "django-admin" => {
                     if body.contains("Django administration") || body.contains("csrfmiddlewaretoken") {
                         if let Some(tech) = find_tech("Django") {
@@ -931,8 +954,15 @@ impl TechnologyAnalyzer {
                     }
                 }
                 "generic-admin" => {
-                    // /admin/ — could be many things; only act if there's a strong keyword
-                    if body.contains("Django administration") {
+                    // /admin/ — could be many things; only act on a marker that is
+                    // specific to Django. "csrfmiddlewaretoken" is Django's CSRF
+                    // field name and "static/admin/css" is its bundled admin CSS
+                    // path; sites with a customised admin (python.org) drop the
+                    // "Django administration" heading but keep both of these.
+                    if body.contains("Django administration")
+                        || body.contains("csrfmiddlewaretoken")
+                        || body.contains("static/admin/css")
+                    {
                         if let Some(tech) = find_tech("Django") {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "admin", 85, None);
                         }
@@ -1280,5 +1310,69 @@ impl TechnologyAnalyzer {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod django_probe_tests {
+    use super::*;
+    use crate::types::Technology;
+
+    fn paths(techs: &[Technology], full_scan: bool) -> Vec<String> {
+        build_probe_list("https://example.com", techs, full_scan)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    fn tech(name: &str) -> Technology {
+        Technology {
+            name: name.to_string(),
+            confidence: 100,
+            version: None,
+            categories: Vec::new(),
+            website: None,
+            description: None,
+            icon: None,
+            cpe: None,
+            saas: None,
+            pricing: None,
+            signals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn django_probes_reachable_under_full_scan_without_prior_python_detection() {
+        // Regression: Django emits no header/script fingerprint, so a real site
+        // reaches this point with only infra technologies detected. The probes
+        // used to be gated behind a Django/Python detection that could never
+        // happen, making them unreachable.
+        let detected = vec![tech("Nginx"), tech("Varnish"), tech("Fastly"), tech("HSTS")];
+        let p = paths(&detected, true);
+        assert!(p.iter().any(|u| u.ends_with("/admin/")), "expected /admin/ probe, got {p:?}");
+        assert!(p.iter().any(|u| u.ends_with("/static/admin/css/base.css")));
+    }
+
+    #[test]
+    fn static_admin_probe_targets_a_file_not_a_directory() {
+        // /static/admin/ returns 404 (djangoproject.com) or 403 (python.org);
+        // the stylesheet beneath it returns 200.
+        let p = paths(&[], true);
+        assert!(!p.iter().any(|u| u.ends_with("/static/admin/")));
+        assert!(p.iter().any(|u| u.ends_with("/static/admin/css/base.css")));
+    }
+
+    #[test]
+    fn default_scan_gate_is_unchanged_for_non_python_sites() {
+        let detected = vec![tech("Nginx")];
+        let p = paths(&detected, false);
+        assert!(!p.iter().any(|u| u.ends_with("/admin/")), "default scan must not grow");
+    }
+
+    #[test]
+    fn django_static_accepts_only_200() {
+        assert!(accepts_status_for_tag("django-static", 200));
+        assert!(!accepts_status_for_tag("django-static", 403));
+        assert!(!accepts_status_for_tag("django-static", 404));
     }
 }
