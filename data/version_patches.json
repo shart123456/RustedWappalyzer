@@ -1,0 +1,139 @@
+{
+  "Apache JSPWiki": {
+    "meta": {
+      "generator": "JSPWiki v([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Apache Wicket": {
+    "js": {
+      "Wicket.Version": "(.+)\\;version:\\1"
+    }
+  },
+  "CKAN": {
+    "headers": {
+      "x-ckan-version": "^([\\d.]+)\\;version:\\1"
+    },
+    "js": {
+      "ckan.CKAN_VERSION": "(.+)\\;version:\\1"
+    }
+  },
+  "Craft CMS": {
+    "meta": {
+      "generator": "Craft CMS ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "DSpace": {
+    "meta": {
+      "generator": "DSpace ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Dotclear": {
+    "meta": {
+      "generator": "Dotclear ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "ELOG HTTP": {
+    "headers": {
+      "Server": "^ELOG HTTP v([\\d.]+)\\;version:\\1"
+    }
+  },
+  "EPrints": {
+    "meta": {
+      "generator": "EPrints ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Etherpad": {
+    "headers": {
+      "Server": "^Etherpad[/ ]([\\d.]+)\\;version:\\1"
+    },
+    "js": {
+      "clientVars.version": "(.+)\\;version:\\1"
+    }
+  },
+  "Fat-Free Framework": {
+    "headers": {
+      "X-Powered-By": "^Fat-Free Framework/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Foswiki": {
+    "meta": {
+      "generator": "Foswiki[-/ ]([\\d.]+)\\;version:\\1"
+    }
+  },
+  "GoAhead": {
+    "headers": {
+      "Server": "GoAhead(?:-Webs)?/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "HCL Domino": {
+    "headers": {
+      "Server": "Lotus-Domino/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Ktor": {
+    "headers": {
+      "server": "^[Kk]tor/([\\d.]+)\\;version:\\1",
+      "x-engine": "^[Kk]tor[/ ]([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Magnolia CMS": {
+    "meta": {
+      "generator": "Magnolia[^,]*,version=([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Mastodon": {
+    "meta": {
+      "generator": "Mastodon v?([\\d.]+)\\;version:\\1"
+    }
+  },
+  "OpenBSD httpd": {
+    "headers": {
+      "Server": "^OpenBSD httpd/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "OpenCms": {
+    "headers": {
+      "Server": "OpenCms/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Piwigo": {
+    "meta": {
+      "generator": "Piwigo ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "PrestaShop": {
+    "js": {
+      "prestashop.version": "(.+)\\;version:\\1"
+    }
+  },
+  "ProcessWire": {
+    "meta": {
+      "generator": "ProcessWire ([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Shiny": {
+    "headers": {
+      "x-powered-by": "Shiny Server(?:\\s+Pro)?/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Statamic": {
+    "headers": {
+      "x-powered-by": "^Statamic[/ ]([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Web2py": {
+    "meta": {
+      "web2py_version": "^([\\d.]+)\\;version:\\1"
+    }
+  },
+  "Zope": {
+    "headers": {
+      "Server": "^Zope/([\\d.]+)\\;version:\\1"
+    }
+  },
+  "eZ Publish": {
+    "meta": {
+      "generator": "eZ (?:Publish|Platform) ([\\d.]+)\\;version:\\1"
+    }
+  }
+}
