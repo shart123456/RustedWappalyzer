@@ -68,44 +68,109 @@ fn strip_scheme(url: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// Find the closest available Wayback snapshot within ±7 days of `lookback_days` ago.
-/// Returns `(timestamp, archive_url)` or `None` if no snapshot is found.
-pub async fn find_snapshot(url: &str, lookback_days: u32) -> Result<Option<(String, String)>> {
+/// Parse a CDX JSON body into the first snapshot timestamp, if any.
+///
+/// The CDX API returns `[["timestamp","statuscode"], ["20250813185136","200"]]`,
+/// or an empty body when nothing matched. Anything that is not a well-formed
+/// array with at least one data row is treated as "no snapshot" rather than an
+/// error, since a caller cannot act on the difference.
+pub fn parse_cdx_timestamp(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let data: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let rows = data.as_array()?;
+    // Row 0 is the field header; row 1 is the first match.
+    let row = rows.get(1)?.as_array()?;
+    let ts = row.first()?.as_str()?;
+    if ts.is_empty() {
+        None
+    } else {
+        Some(ts.to_string())
+    }
+}
+
+/// Build the CDX query URL for a `±7`-day window centred `lookback_days` ago.
+fn cdx_query_url(url: &str, lookback_days: u32) -> String {
     let bare = strip_scheme(url);
     let bare_encoded: String = url::form_urlencoded::byte_serialize(bare.as_bytes()).collect();
-    // Search a ±7-day window centered on the target date
     let from_date = days_ago_yyyymmdd((lookback_days + 7) as i64);
-    let to_date   = days_ago_yyyymmdd(lookback_days.saturating_sub(7) as i64);
-
-    let cdx_url = format!(
+    let to_date = days_ago_yyyymmdd(lookback_days.saturating_sub(7) as i64);
+    format!(
         "https://web.archive.org/cdx/search/cdx?url={}&output=json&fl=timestamp,statuscode&filter=statuscode:200&limit=1&from={}&to={}999999",
         bare_encoded, from_date, to_date
-    );
+    )
+}
+
+/// Number of attempts made against the CDX endpoint before giving up.
+const CDX_ATTEMPTS: u32 = 3;
+
+/// Find the closest available Wayback snapshot within ±7 days of `lookback_days` ago.
+/// Returns `(timestamp, archive_url)` or `None` if no snapshot is found.
+///
+/// The CDX endpoint throttles aggressively: concurrent or rapid queries are
+/// answered with `503` and an HTML error page, or by dropping the connection.
+/// We therefore check the status before parsing (so an HTML error page is never
+/// fed to the JSON parser) and retry transient failures with a linear backoff.
+pub async fn find_snapshot(url: &str, lookback_days: u32) -> Result<Option<(String, String)>> {
+    let cdx_url = cdx_query_url(url, lookback_days);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .user_agent("Mozilla/5.0")
         .build()?;
 
-    let resp = client.get(&cdx_url).send().await?;
-    let data: serde_json::Value = resp.json().await?;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    let rows = match data.as_array() {
-        Some(r) if r.len() >= 2 => r,
-        _ => return Ok(None),
-    };
+    for attempt in 1..=CDX_ATTEMPTS {
+        if attempt > 1 {
+            // Linear backoff: 1s, then 2s. Cheap, and enough to clear the
+            // short-lived throttle the CDX endpoint applies.
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64 - 1)).await;
+        }
 
-    let row = match rows.get(1).and_then(|r| r.as_array()) {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-    let ts = match row.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => return Ok(None),
-    };
+        let resp = match client.get(&cdx_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "CDX request failed; retrying");
+                last_err = Some(anyhow::anyhow!("CDX request failed: {}", e));
+                continue;
+            }
+        };
 
-    let archive_url = format!("https://web.archive.org/web/{}/{}", ts, url);
-    Ok(Some((ts, archive_url)))
+        let status = resp.status();
+        if !status.is_success() {
+            // 429/5xx are the throttle responses and are worth retrying.
+            // Everything else is a hard failure and is reported as such
+            // instead of being misreported as a body-decoding problem.
+            if status.as_u16() == 429 || status.is_server_error() {
+                tracing::warn!(attempt, %status, "CDX endpoint throttled; retrying");
+                last_err = Some(anyhow::anyhow!(
+                    "CDX endpoint returned {} (rate limited)",
+                    status
+                ));
+                continue;
+            }
+            return Err(anyhow::anyhow!("CDX endpoint returned {}", status));
+        }
+
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "CDX body read failed; retrying");
+                last_err = Some(anyhow::anyhow!("CDX body read failed: {}", e));
+                continue;
+            }
+        };
+
+        return Ok(parse_cdx_timestamp(&body).map(|ts| {
+            let archive_url = format!("https://web.archive.org/web/{}/{}", ts, url);
+            (ts, archive_url)
+        }));
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("CDX lookup failed after {} attempts", CDX_ATTEMPTS)))
 }
 
 /// Diff current vs one historical `AnalysisResult` and produce a `SnapshotComparison`.
@@ -182,5 +247,54 @@ pub fn compare_snapshot(
         added,
         removed,
         version_changes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_first_data_row() {
+        let body = "[[\"timestamp\",\"statuscode\"],\n[\"20250813185136\",\"200\"]]";
+        assert_eq!(parse_cdx_timestamp(body).as_deref(), Some("20250813185136"));
+    }
+
+    #[test]
+    fn empty_body_is_no_snapshot_not_an_error() {
+        assert_eq!(parse_cdx_timestamp(""), None);
+        assert_eq!(parse_cdx_timestamp("   \n"), None);
+    }
+
+    #[test]
+    fn header_only_response_is_no_snapshot() {
+        assert_eq!(parse_cdx_timestamp("[[\"timestamp\",\"statuscode\"]]"), None);
+    }
+
+    #[test]
+    fn html_error_page_is_no_snapshot_not_a_panic() {
+        // Regression: archive.org answers throttled requests with an HTML 503
+        // page. This used to reach serde and surface as a misleading
+        // "error decoding response body".
+        let html = "<html><head><title>503 Service Unavailable</title></head></html>";
+        assert_eq!(parse_cdx_timestamp(html), None);
+    }
+
+    #[test]
+    fn malformed_json_is_no_snapshot() {
+        assert_eq!(parse_cdx_timestamp("[[\"timestamp\""), None);
+        assert_eq!(parse_cdx_timestamp("{\"not\":\"an array\"}"), None);
+    }
+
+    #[test]
+    fn cdx_query_url_targets_a_seven_day_window() {
+        let u = cdx_query_url("https://example.com/", 365);
+        assert!(u.starts_with("https://web.archive.org/cdx/search/cdx?url=example.com&"));
+        assert!(u.contains("output=json"));
+        assert!(u.contains("filter=statuscode:200"));
+        // from is 372 days ago, to is 358 days ago -> from must sort before to
+        let from = u.split("&from=").nth(1).unwrap().split('&').next().unwrap();
+        let to = u.split("&to=").nth(1).unwrap().trim_end_matches("999999");
+        assert!(from < to, "from={} should precede to={}", from, to);
     }
 }
