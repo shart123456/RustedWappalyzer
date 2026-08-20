@@ -59,6 +59,7 @@ impl StandaloneWappalyzer {
 
         let (tech_count, cat_count) = analyzer.get_stats();
         tracing::info!(technologies = tech_count, categories = cat_count, "Database loaded");
+        crate::analyzer::log_skipped_pattern_summary();
 
         let asset_cache = Arc::new(
             moka::sync::Cache::builder()
