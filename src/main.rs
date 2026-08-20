@@ -290,10 +290,10 @@ async fn main() -> Result<()> {
 
             println!("Looking up Wayback Machine snapshots (~365 and ~735 days ago)...");
 
-            let (snap365, snap735) = tokio::join!(
-                wayback::find_snapshot(&url, 365),
-                wayback::find_snapshot(&url, 735),
-            );
+            // Sequential, not concurrent: the CDX endpoint throttles parallel
+            // queries from a single client.
+            let snap365 = wayback::find_snapshot(&url, 365).await;
+            let snap735 = wayback::find_snapshot(&url, 735).await;
 
             let snap365 = snap365.map_err(|e| anyhow::anyhow!("CDX lookup failed (365d): {}", e))?;
             let snap735 = snap735.map_err(|e| anyhow::anyhow!("CDX lookup failed (735d): {}", e))?;

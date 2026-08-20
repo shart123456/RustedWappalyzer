@@ -356,11 +356,11 @@ pub async fn wayback_analyze(
     let confidence = body.confidence.unwrap_or(50);
     let full_scan = body.full_scan.unwrap_or(true);
 
-    // Find both snapshots concurrently
-    let (snap365, snap735) = tokio::join!(
-        crate::wayback::find_snapshot(&body.url, 365),
-        crate::wayback::find_snapshot(&body.url, 735),
-    );
+    // Look the two snapshots up sequentially. The CDX endpoint throttles
+    // concurrent queries from one client, which previously made this endpoint
+    // fail more often than it succeeded.
+    let snap365 = crate::wayback::find_snapshot(&body.url, 365).await;
+    let snap735 = crate::wayback::find_snapshot(&body.url, 735).await;
 
     let snap365 = match snap365 {
         Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({
