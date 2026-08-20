@@ -62,11 +62,17 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     };
     let insecure_data = actix_web::web::Data::new(insecure_wappalyzer);
 
-    // Rate limiter: 600 requests per minute per IP (10 req/s sustained).
+    // Rate limiter: 600 requests per minute per IP by default (10 req/s sustained).
     // Sized for batch consumers; the analyzer's actual CPU work (regex + headers/body
     // scan) is sub-100ms per call, so this is well below what one core can serve.
-    // Override at deploy time by changing the constants if you need stricter limits.
-    let rate_limiter = actix_web::web::Data::new(crate::middleware::RateLimiter::new(600, 60));
+    //
+    // Configurable via env:
+    //   RATE_LIMIT_DISABLED=true      → no-op limiter (use behind a proxy that already
+    //                                    rate-limits; the per-IP limiter would otherwise
+    //                                    see only the proxy IP and throttle everyone).
+    //   RATE_LIMIT_MAX_REQS=<n>       → requests allowed per window (default 600).
+    //   RATE_LIMIT_WINDOW_SECS=<n>    → window length in seconds (default 60).
+    let rate_limiter = actix_web::web::Data::new(build_rate_limiter());
 
     // Optional API key — only enforced when the environment variable is set.
     let api_key: Option<String> = std::env::var("API_KEY").ok();
@@ -141,4 +147,29 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Build the request rate limiter from environment configuration.
+/// See the call site in [`run`] for the recognised variables.
+fn build_rate_limiter() -> crate::middleware::RateLimiter {
+    use crate::middleware::RateLimiter;
+
+    let disabled = std::env::var("RATE_LIMIT_DISABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if disabled {
+        tracing::info!("In-process rate limiter disabled (RATE_LIMIT_DISABLED); relying on upstream");
+        return RateLimiter::disabled();
+    }
+
+    let max_reqs = std::env::var("RATE_LIMIT_MAX_REQS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(600);
+    let window_secs = std::env::var("RATE_LIMIT_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    tracing::info!(max_reqs, window_secs, "In-process rate limiter enabled");
+    RateLimiter::new(max_reqs, window_secs)
 }

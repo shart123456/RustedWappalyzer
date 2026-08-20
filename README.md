@@ -1,6 +1,6 @@
 # RustedWappalyzer
 
-Web technology fingerprinting tool built in Rust. Detects 3,900+ technologies — frameworks, CDNs, analytics, infrastructure — with version extraction and optional CVE/PoC enrichment.
+Web technology fingerprinting tool built in Rust. Detects 7,000+ technologies — frameworks, CDNs, analytics, infrastructure — with version extraction and optional CVE/PoC enrichment.
 
 ## Quick Start
 
@@ -112,7 +112,17 @@ curl -X POST http://localhost:3000/analyze \
 
 ### Rate Limiting
 
-The server enforces **60 requests per minute per IP**. Requests exceeding the limit receive `HTTP 429`.
+The server enforces **600 requests per minute per IP** by default (sliding window). Requests exceeding the limit receive `HTTP 429`.
+
+Configurable via environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `RATE_LIMIT_MAX_REQS` | `600` | Requests allowed per window |
+| `RATE_LIMIT_WINDOW_SECS` | `60` | Window length in seconds |
+| `RATE_LIMIT_DISABLED` | unset | Set to `true`/`1`/`yes` for a no-op limiter |
+
+Disable the in-process limiter when running behind a proxy that already rate-limits: this limiter keys on the peer socket address, which behind a proxy is the proxy's IP for every request, so it would otherwise collapse all clients into a single shared bucket.
 
 ---
 
