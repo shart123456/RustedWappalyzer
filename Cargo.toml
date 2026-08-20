@@ -108,7 +108,9 @@ path = "src/main.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# panic = "abort" is deliberately NOT set: actix-web isolates a panicking
+# request to its worker and replaces it, so unwinding keeps the service up.
+# With abort, one panicking request terminates the whole process.
 
 [profile.dev]
 # Faster compilation in development
