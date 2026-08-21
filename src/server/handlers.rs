@@ -442,35 +442,95 @@ pub async fn batch(
         }));
     }
 
-    // Validate URL schemes first (cheap, synchronous).
-    for url in &body.urls {
+    // Per-URL validation. A URL that fails validation becomes an error entry in
+    // the response rather than rejecting the whole batch: one internal host or
+    // one typo in a 100-URL list should not discard the 99 usable results.
+    // Batch-level problems (size, auth, rate limit, malformed body) still fail
+    // the request as a whole, because they are properties of the request rather
+    // than of any single target.
+    let mut rejection: Vec<Option<String>> = vec![None; body.urls.len()];
+
+    // Scheme check is synchronous and cheap, so it runs first and spares a DNS
+    // lookup for anything already known to be unusable.
+    for (idx, url) in body.urls.iter().enumerate() {
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": format!("URL '{}' must use http:// or https:// scheme", url)
-            }));
+            rejection[idx] =
+                Some(format!("URL '{}' must use http:// or https:// scheme", url));
         }
     }
 
-    // SSRF-check all URLs concurrently (DNS lookups are independent).
-    let ssrf_checks: Vec<_> = body.urls.iter().map(|url| {
-        let url = url.clone();
-        async move { is_safe_url(&url).await.map_err(|e| e) }
-    }).collect();
-    for result in futures::future::join_all(ssrf_checks).await {
-        if let Err(e) = result {
-            return HttpResponse::BadRequest().json(serde_json::json!({ "error": e }));
+    // SSRF-check the survivors concurrently; DNS lookups are independent.
+    let pending: Vec<usize> = (0..body.urls.len())
+        .filter(|idx| rejection[*idx].is_none())
+        .collect();
+    let checks = pending.into_iter().map(|idx| {
+        let url = body.urls[idx].clone();
+        async move { (idx, is_safe_url(&url).await) }
+    });
+    for (idx, outcome) in join_all(checks).await {
+        if let Err(e) = outcome {
+            rejection[idx] = Some(e);
         }
     }
 
-    match data.analyze_urls_batch(body.urls.clone(), concurrency, confidence, full_scan).await {
-        Ok(results) => {
-            let enriched = join_all(
-                results.into_iter().map(|r| enrich_result(r, Arc::clone(&vault_arc), Arc::clone(&poc_vault_arc), Arc::clone(&alert_vault_arc)))
-            ).await;
-            HttpResponse::Ok().json(enriched)
+    // Analyze only what survived validation.
+    let accepted: Vec<usize> = (0..body.urls.len())
+        .filter(|idx| rejection[*idx].is_none())
+        .collect();
+    let accepted_urls: Vec<String> =
+        accepted.iter().map(|&idx| body.urls[idx].clone()).collect();
+
+    let analyzed = if accepted_urls.is_empty() {
+        Vec::new()
+    } else {
+        match data
+            .analyze_urls_batch(accepted_urls, concurrency, confidence, full_scan)
+            .await
+        {
+            Ok(results) => results,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .json(serde_json::json!({ "error": e.to_string() }))
+            }
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": e.to_string()
-        })),
+    };
+
+    // Reassemble in request order. analyze_urls_batch returns one result per
+    // input in input order, so accepted indices and results line up positionally
+    // -- matching on the URL string would be ambiguous for duplicate entries.
+    let mut slots: Vec<Option<AnalysisResult>> = vec![None; body.urls.len()];
+    for (&idx, result) in accepted.iter().zip(analyzed.into_iter()) {
+        slots[idx] = Some(result);
     }
+
+    let ordered: Vec<AnalysisResult> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| match slot {
+            Some(result) => result,
+            None => AnalysisResult {
+                url: body.urls[idx].clone(),
+                technologies: Vec::new(),
+                analysis_time_ms: 0,
+                response_info: None,
+                // A slot with no result and no rejection would mean the analyzer
+                // returned fewer results than inputs, which it should not; say so
+                // rather than emitting a silently empty entry.
+                error: Some(rejection[idx].clone().unwrap_or_else(|| {
+                    "No analysis result was produced for this URL".to_string()
+                })),
+            },
+        })
+        .collect();
+
+    let enriched = join_all(ordered.into_iter().map(|r| {
+        enrich_result(
+            r,
+            Arc::clone(&vault_arc),
+            Arc::clone(&poc_vault_arc),
+            Arc::clone(&alert_vault_arc),
+        )
+    }))
+    .await;
+    HttpResponse::Ok().json(enriched)
 }
