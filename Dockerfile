@@ -48,7 +48,7 @@ RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
 # Copy binary
-COPY --from=builder /app/target/release/wappalyzer /usr/local/bin/wappalyzer
+COPY --from=builder /app/target/release/rustywap /usr/local/bin/rustywap
 
 # Seed the writable cache directory with the baked technology DB, then hand
 # ownership to the non-root user so the cache module can refresh it at runtime.
@@ -69,4 +69,4 @@ EXPOSE 3000
 # security context in deploy/k8s/wappalyzer.yaml.
 USER app
 
-CMD ["wappalyzer", "serve"]
+CMD ["rustywap", "serve"]

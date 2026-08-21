@@ -7,8 +7,8 @@ Web technology fingerprinting tool built in Rust. Detects 7,000+ technologies â€
 ```bash
 git clone https://github.com/shart123456/RustedWappalyzer
 cd RustedWappalyzer
-docker build -t wappalyzer .
-docker run -d -p 3000:3000 --name wappalyzer wappalyzer
+docker build -t rustywap .
+docker run -d -p 3000:3000 --name rustywap rustywap
 ```
 
 The API is now running at `http://localhost:3000`.
@@ -98,7 +98,7 @@ curl http://localhost:3000/info
 Set the `API_KEY` environment variable to require bearer token authentication on all endpoints:
 
 ```bash
-docker run -d -p 3000:3000 -e API_KEY=mysecretkey wappalyzer
+docker run -d -p 3000:3000 -e API_KEY=mysecretkey rustywap
 ```
 
 ```bash
@@ -139,43 +139,43 @@ Responses are cached in-memory (1,000 entries, 60-second TTL) keyed on URL + opt
 cargo build --release
 
 # Analyze a single URL (table output)
-./target/release/wappalyzer analyze https://example.com
+./target/release/rustywap analyze https://example.com
 
 # JSON output
-./target/release/wappalyzer analyze https://example.com --format json
+./target/release/rustywap analyze https://example.com --format json
 
 # Simple one-per-line output
-./target/release/wappalyzer analyze https://example.com --format simple
+./target/release/rustywap analyze https://example.com --format simple
 
 # Verbose output
-./target/release/wappalyzer analyze https://example.com --verbose
+./target/release/rustywap analyze https://example.com --verbose
 
 # Full scan â€” probes extra endpoints for version info
-./target/release/wappalyzer analyze https://example.com --full-scan
+./target/release/rustywap analyze https://example.com --full-scan
 
 # Skip SSL verification
-./target/release/wappalyzer analyze https://example.com --insecure
+./target/release/rustywap analyze https://example.com --insecure
 
 # Batch from file (one URL per line)
-./target/release/wappalyzer batch urls.txt --concurrency 10 --output results.json
+./target/release/rustywap batch urls.txt --concurrency 10 --output results.json
 
 # Historical comparison via Wayback Machine
-./target/release/wappalyzer wayback https://example.com
+./target/release/rustywap wayback https://example.com
 
 # Start the API server
-./target/release/wappalyzer serve --port 3000
+./target/release/rustywap serve --port 3000
 
 # Update the technology database
-./target/release/wappalyzer update
+./target/release/rustywap update
 
 # Force re-fetch (ignore cached database)
-./target/release/wappalyzer update --force
+./target/release/rustywap update --force
 
 # Show database stats
-./target/release/wappalyzer info
+./target/release/rustywap info
 
 # Run performance benchmark
-./target/release/wappalyzer benchmark --count 100 --threads 5
+./target/release/rustywap benchmark --count 100 --threads 5
 ```
 
 ---
@@ -218,7 +218,7 @@ When a MongoDB instance is available, detected technologies are automatically en
 ```bash
 docker run -d -p 3000:3000 \
   -e MONGODB_URI=mongodb://localhost:27017 \
-  wappalyzer
+  rustywap
 ```
 
 The server connects to two optional databases:

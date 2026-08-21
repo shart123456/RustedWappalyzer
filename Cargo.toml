@@ -100,7 +100,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "wappalyzer"
+name = "rustywap"
 path = "src/main.rs"
 
 [profile.release]
