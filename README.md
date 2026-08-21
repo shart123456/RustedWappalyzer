@@ -1,17 +1,30 @@
 # RustedWappalyzer
 
-Web technology fingerprinting tool built in Rust. Detects 7,000+ technologies — frameworks, CDNs, analytics, infrastructure — with version extraction and optional CVE/PoC enrichment.
+[![CI](https://github.com/shart123456/RustedWappalyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/shart123456/RustedWappalyzer/actions/workflows/ci.yml)
+
+Web technology fingerprinting tool built in Rust. Detects 7,500+ technologies — frameworks, CDNs, analytics, infrastructure — with version extraction and optional CVE/PoC enrichment.
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/shart123456/RustedWappalyzer
 cd RustedWappalyzer
-docker build -t rustywap .
-docker run -d -p 3000:3000 --name rustywap rustywap
+
+# The image bakes in the technology database, which is not tracked in git
+# (see .gitignore). Fetch it into the build context once before building --
+# WAPPALYZER_CACHE is required here, because `update` otherwise writes the
+# file next to the binary in target/release/ rather than to the repo root.
+WAPPALYZER_CACHE=./wappalyzer_cache.json cargo run --release -- update
+
+docker build -t wappalyzer .
+docker run -d -p 3000:3000 --name wappalyzer wappalyzer
 ```
 
 The API is now running at `http://localhost:3000`.
+
+The container runs as an unprivileged user (uid 10001). The database lives in
+`/data` inside the image; because no volume is declared, a refreshed database is
+kept across container *restarts* but not across container *recreation*.
 
 ---
 
@@ -77,7 +90,17 @@ curl -X POST http://localhost:3000/wayback \
   -d '{"url": "https://example.com"}'
 ```
 
+| Field | Default | Description |
+|---|---|---|
+| `url` | required | Target URL |
+| `confidence` | `50` | Minimum confidence threshold |
+| `full_scan` | **`true`** | Probe extra endpoints — note this defaults to `true` here, unlike `/analyze` |
+
 Returns current technologies plus two historical snapshots, showing added/removed technologies and version changes over time.
+
+The two CDX lookups run sequentially and retry on throttling: the Wayback CDX
+endpoint rate-limits parallel queries from one client and answers with an HTML
+`503`, so concurrent lookups fail more often than they succeed.
 
 ---
 
@@ -87,7 +110,7 @@ Returns current technologies plus two historical snapshots, showing added/remove
 # Health check
 curl http://localhost:3000/health
 
-# Database info (technology count, categories)
+# Database info (exact technology/category count for the loaded database)
 curl http://localhost:3000/info
 ```
 
@@ -194,7 +217,7 @@ Detection is performed across nine independent layers, then merged with noisy-OR
 | **Cookies** | Generic cookie detection: Express (`connect.sid`), Django (`csrftoken`), Laravel, Shopify, Google Analytics, Hotjar, HubSpot |
 | **CSP** | Content-Security-Policy domain parsing; 60+ SaaS/service mappings (Sentry, Intercom, Hotjar, Datadog, Stripe, Rollbar, Mixpanel, Zendesk, HubSpot, Cloudinary, etc.) |
 | **DNS** | CNAME chain analysis (40+ CDN/hosting patterns), MX records (12 email providers), TXT records; includes `www.` variant and A-record resolution |
-| **Probes** (`full_scan`) | `/package.json`, `/wp-json/`, `/actuator/info`, `/healthz`, `/readyz`, `/livez`, `/_health`, `/metrics` |
+| **Probes** (`full_scan`) | `/package.json`, `/wp-json/`, `/actuator/info`, `/healthz`, `/readyz`, `/livez`, `/_health`, `/metrics`, `/admin/`, `/admin/login/`, `/static/admin/css/base.css` |
 
 ### How Version Detection Works
 
@@ -248,19 +271,28 @@ Enriched response fields:
 2. **DNS resolver hook** — In server mode, a custom `SsrfDnsResolver` is installed on the HTTP client and re-validates every resolved IP at TCP-connect time. This mitigates DNS rebinding attacks where a hostname resolves to a public IP during the pre-flight but rebinds to a private IP by the time the connection is made.
 
 Blocked address ranges:
+- Unspecified (`0.0.0.0/8`, `::`) — `0.0.0.0` routes to localhost on Linux
 - Loopback (`127.0.0.0/8`, `::1`)
 - Private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-- Link-local (`169.254.0.0/16`, `fe80::/10`)
+- CGNAT (`100.64.0.0/10`) — routable inside many cloud networks
+- Link-local (`169.254.0.0/16`, `fe80::/10`) — includes the cloud metadata IP `169.254.169.254`
 - Unique local IPv6 (`fc00::/7`)
 - IPv4-mapped IPv6 (`::ffff:x.x.x.x`) for all of the above
 
+A hostname resolving to both a public and a private address stays reachable on
+the public one; the private address is filtered out and never dialled.
+
 **Response body cap** — Fetched pages are truncated at 10 MB to prevent memory exhaustion from abnormally large responses.
 
-**Rate limiting** — 60 requests/minute per IP (sliding window), enforced server-side. Excess requests receive `HTTP 429`.
+**Rate limiting** — 600 requests/minute per IP by default (sliding window), enforced server-side on `/analyze`, `/batch` and `/wayback`. `/health` and `/info` are exempt. Excess requests receive `HTTP 429`. See [Rate Limiting](#rate-limiting) for the environment variables.
 
 **API key auth** — Optional bearer token via `API_KEY` env var. Comparison is constant-time to prevent timing attacks.
 
 **Request body limit** — JSON request bodies are capped at 64 KB by the Actix-web layer.
+
+**Uniform error responses** — every failure returns `{"error": "..."}`, including
+malformed request bodies and unknown routes, so a client only ever parses one
+shape.
 
 ---
 
@@ -336,6 +368,9 @@ src/
 |---|---|---|
 | `API_KEY` | _(none)_ | Bearer token required on all endpoints when set |
 | `MONGODB_URI` | _(none)_ | MongoDB connection string for CVE/PoC/KEV enrichment |
+| `RATE_LIMIT_MAX_REQS` | `600` | Requests allowed per rate-limit window |
+| `RATE_LIMIT_WINDOW_SECS` | `60` | Rate-limit window length in seconds |
+| `RATE_LIMIT_DISABLED` | _(unset)_ | Set to `true`/`1`/`yes` to disable the in-process limiter (use behind a proxy that already rate-limits) |
 | `WAPPALYZER_CACHE` | next to binary | Path to the cached technology database JSON file |
 | `WAPPALYZER_DB_URL` | `https://raw.githubusercontent.com/enthec/webappanalyzer/main/src` | Base URL for fetching the technology database. Override to use a corporate proxy or private mirror — the server will append `/technologies/{letter}.json` and `/categories.json` automatically. |
 | `RUST_LOG` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
