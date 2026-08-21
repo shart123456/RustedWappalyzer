@@ -509,6 +509,88 @@ mod http_tests {
     }
 
     #[actix_web::test]
+    async fn batch_reports_per_url_errors_instead_of_failing_the_whole_request() {
+        // One unusable target used to reject the entire batch. Now each entry
+        // carries its own outcome, so the usable ones still come back.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(
+                    r#"{"urls":["http://10.0.0.1/","file:///etc/passwd","http://127.0.0.1/"]}"#,
+                )
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "a bad entry must not fail the request");
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let entries = body.as_array().expect("expected an array of results");
+        assert_eq!(entries.len(), 3, "one entry per input URL");
+
+        // Order is preserved and each error describes its own URL.
+        assert_eq!(entries[0]["url"], "http://10.0.0.1/");
+        assert!(entries[0]["error"].as_str().unwrap().contains("private/internal"));
+        assert_eq!(entries[1]["url"], "file:///etc/passwd");
+        assert!(entries[1]["error"].as_str().unwrap().contains("http:// or https://"));
+        assert_eq!(entries[2]["url"], "http://127.0.0.1/");
+        assert!(entries[2]["error"].as_str().unwrap().contains("private/internal"));
+    }
+
+    #[actix_web::test]
+    async fn batch_preserves_input_order_including_duplicates() {
+        // Results are spliced back positionally, so repeated URLs must not
+        // collapse or swap.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(
+                    r#"{"urls":["file:///a","http://10.0.0.1/","file:///a","http://192.168.1.1/"]}"#,
+                )
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let urls: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            urls,
+            vec!["file:///a", "http://10.0.0.1/", "file:///a", "http://192.168.1.1/"]
+        );
+    }
+
+    #[actix_web::test]
+    async fn batch_size_limit_still_fails_the_whole_request() {
+        // Batch-level limits are a property of the request, not of any single
+        // target, so they remain a 400 rather than becoming per-URL errors.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let urls: Vec<String> = (0..101).map(|_| "http://10.0.0.1/".to_string()).collect();
+        let payload = serde_json::json!({ "urls": urls }).to_string();
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(payload)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(body["error"].as_str().unwrap().contains("exceeds maximum"));
+    }
+
+    #[actix_web::test]
     async fn non_http_scheme_is_rejected() {
         let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
         for url in ["file:///etc/passwd", "gopher://127.0.0.1/", "not-a-url"] {
