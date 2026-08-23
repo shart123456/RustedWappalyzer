@@ -38,6 +38,31 @@ fn record_skipped_pattern(pattern: &str) -> bool {
     *counter == 1
 }
 
+/// Patterns that needed the backtracking engine, recorded once each. Tracked
+/// separately from skipped patterns: these now work, and conflating "we fell back"
+/// with "we gave up" is what made the original gap hard to see.
+static LOOKAROUND_PATTERNS: Lazy<std::sync::Mutex<HashMap<String, u32>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn record_lookaround_pattern(pattern: &str) -> bool {
+    let mut guard = match LOOKAROUND_PATTERNS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let counter = guard.entry(pattern.to_string()).or_insert(0);
+    *counter += 1;
+    *counter == 1
+}
+
+/// Returns `(unique_patterns, total_occurrences)` for look-around fallbacks so far.
+pub fn lookaround_pattern_stats() -> (usize, u32) {
+    let guard = match LOOKAROUND_PATTERNS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    (guard.len(), guard.values().sum())
+}
+
 /// Returns `(unique_patterns, total_occurrences)` for patterns skipped so far.
 pub fn skipped_pattern_stats() -> (usize, u32) {
     let guard = match SKIPPED_PATTERNS.lock() {
@@ -64,6 +89,15 @@ pub fn skipped_patterns() -> Vec<String> {
 /// the per-pattern messages were the only signal, and they were both repetitive
 /// and easy to scroll past.
 pub fn log_skipped_pattern_summary() {
+    let (fallback_unique, fallback_total) = lookaround_pattern_stats();
+    if fallback_unique > 0 {
+        tracing::info!(
+            unique_patterns = fallback_unique,
+            total_occurrences = fallback_total,
+            "Patterns using look-around were compiled with the backtracking engine"
+        );
+    }
+
     let (unique, total) = skipped_pattern_stats();
     if unique == 0 {
         return;
@@ -71,7 +105,7 @@ pub fn log_skipped_pattern_summary() {
     tracing::info!(
         unique_patterns = unique,
         total_occurrences = total,
-        "Some database patterns use unsupported regex features (look-around) and were skipped; \
+        "Some database patterns could not be compiled by either regex engine; \
          affected technologies fall back to their remaining patterns"
     );
     for pattern in skipped_patterns() {
@@ -588,7 +622,7 @@ impl TechnologyAnalyzer {
         if pattern.is_empty() {
             // Empty pattern = presence-only detection (header/cookie just needs to exist)
             return Ok(Some(CompiledPattern {
-                regex: Regex::new(".*").unwrap(),
+                regex: PatternRegex::Fast(Regex::new(".*").unwrap()),
                 confidence: 100,
                 version: None,
             }));
@@ -613,24 +647,48 @@ impl TechnologyAnalyzer {
         }
 
         // Compile regex with case-insensitive flag
-        match Regex::new(&format!("(?i){}", regex_pattern)) {
+        let cased = format!("(?i){}", regex_pattern);
+        match Regex::new(&cased) {
             Ok(regex) => Ok(Some(CompiledPattern {
-                regex,
+                regex: PatternRegex::Fast(regex),
                 confidence,
                 version,
             })),
-            Err(e) => {
-                // Log each distinct pattern once. Every analyzer instance
-                // recompiles the database, so an unconditional warn! here
-                // repeated the same messages and drowned the startup log.
-                if record_skipped_pattern(regex_pattern) {
-                    tracing::warn!(
-                        pattern = %regex_pattern,
-                        error = %e,
-                        "Skipping database pattern that the regex crate cannot compile"
-                    );
+            Err(fast_err) => {
+                // The `regex` crate rejects look-around by design, and the database uses
+                // it. These patterns used to be dropped, silently narrowing detection for
+                // the technologies that relied on them. Retry on the backtracking engine,
+                // which does support look-around.
+                match fancy_regex::Regex::new(&cased) {
+                    Ok(fancy) => {
+                        if record_lookaround_pattern(regex_pattern) {
+                            tracing::debug!(
+                                pattern = %regex_pattern,
+                                "Pattern needs look-around; compiled with the backtracking engine"
+                            );
+                        }
+                        Ok(Some(CompiledPattern {
+                            regex: PatternRegex::Fancy(Box::new(fancy)),
+                            confidence,
+                            version,
+                        }))
+                    }
+                    Err(fancy_err) => {
+                        // Neither engine can compile it. Log each distinct pattern once:
+                        // every analyzer instance recompiles the database, so an
+                        // unconditional warn! repeated the same messages and drowned
+                        // the startup log.
+                        if record_skipped_pattern(regex_pattern) {
+                            tracing::warn!(
+                                pattern = %regex_pattern,
+                                regex_error = %fast_err,
+                                fancy_error = %fancy_err,
+                                "Skipping database pattern that neither regex engine can compile"
+                            );
+                        }
+                        Ok(None)
+                    }
                 }
-                Ok(None)
             }
         }
     }
@@ -739,7 +797,7 @@ impl TechnologyAnalyzer {
     /// Supports Wappalyzer's full version template syntax:
     /// - `\1`, `\2` … — capture group substitution
     /// - `\1?a:b`     — ternary: use `a` if group 1 matched non-empty, else `b`
-    pub fn extract_version(version_pattern: &Option<String>, captures: &regex::Captures) -> Option<String> {
+    pub fn extract_version(version_pattern: &Option<String>, captures: &PatternCaptures) -> Option<String> {
         let pattern = version_pattern.as_ref()?;
         let mut version = pattern.clone();
 
@@ -755,7 +813,7 @@ impl TechnologyAnalyzer {
             let snapshot = version.clone();
             if let Some(cap) = TERNARY_RE.captures(&snapshot) {
                 let group_num: usize = cap[1].parse().unwrap_or(0);
-                let group_val = captures.get(group_num).map(|m| m.as_str()).unwrap_or("");
+                let group_val = captures.group(group_num).unwrap_or("");
                 let replacement = if !group_val.is_empty() { cap[2].to_string() } else { cap[3].to_string() };
                 version = version.replacen(&cap[0], &replacement, 1);
             } else {
@@ -766,7 +824,7 @@ impl TechnologyAnalyzer {
         // Replace capture group references \1 … \9
         for i in 1..captures.len() {
             let placeholder = format!("\\{}", i);
-            let capture_val = captures.get(i).map(|m| m.as_str()).unwrap_or("");
+            let capture_val = captures.group(i).unwrap_or("");
             version = version.replace(&placeholder, capture_val);
         }
 
@@ -1351,17 +1409,75 @@ mod skipped_pattern_tests {
     use super::*;
 
     #[test]
-    fn look_around_patterns_are_skipped_not_fatal() {
-        // Representative of the shapes actually present in the database.
+    fn look_around_patterns_now_compile_on_the_fallback_engine() {
+        // These used to be dropped at startup, silently narrowing detection for the
+        // technologies that relied on them. Every shape below is taken verbatim from
+        // the database.
         for pat in [
             r"^(?!.*player).*aniview\.com/",
             r"<(?!svg)[^>]+\sdata-v(?:ue)?-",
             r"\b(?<!-)UPS\b",
+            r"^(?:(?!psecn).)*$",
+            r"/sites/(?!(?:default|all)/).*/(?:files|themes|modules)/",
+            r"leaflet.{0,32}\.js(?!.+shopify)",
+            r"(?<!elo\.io)/cargo\.",
+            r"\.acquire\.io/(?!cobrowse)",
         ] {
-            let out = TechnologyAnalyzer::compile_single_pattern(pat);
-            assert!(out.is_ok(), "compilation must not error for {pat}");
-            assert!(out.unwrap().is_none(), "{pat} should be skipped");
+            let out = TechnologyAnalyzer::compile_single_pattern(pat)
+                .unwrap_or_else(|e| panic!("compilation errored for {pat}: {e}"));
+            let compiled = out.unwrap_or_else(|| panic!("{pat} should compile, not be skipped"));
+            assert!(
+                matches!(compiled.regex, PatternRegex::Fancy(_)),
+                "{pat} should land on the backtracking engine"
+            );
         }
+    }
+
+    #[test]
+    fn look_around_semantics_are_actually_honoured() {
+        // Compiling is not enough — the assertion has to work, or we would have traded
+        // a missing pattern for a wrong one.
+        let neg = TechnologyAnalyzer::compile_single_pattern(r"^(?:(?!psecn).)*$")
+            .unwrap()
+            .expect("compiles");
+        assert!(neg.regex.is_match("harmless string"));
+        assert!(!neg.regex.is_match("contains psecn here"));
+
+        let drupal = TechnologyAnalyzer::compile_single_pattern(
+            r"/sites/(?!(?:default|all)/).*/(?:files|themes|modules)/",
+        )
+        .unwrap()
+        .expect("compiles");
+        assert!(drupal.regex.is_match("/sites/example.com/files/"));
+        assert!(!drupal.regex.is_match("/sites/default/files/"));
+        assert!(!drupal.regex.is_match("/sites/all/modules/"));
+
+        let leaflet = TechnologyAnalyzer::compile_single_pattern(r"leaflet.{0,32}\.js(?!.+shopify)")
+            .unwrap()
+            .expect("compiles");
+        assert!(leaflet.regex.is_match("/js/leaflet.js"));
+        assert!(!leaflet.regex.is_match("/js/leaflet.js?from=shopify"));
+
+        let lookbehind = TechnologyAnalyzer::compile_single_pattern(r"(?<!elo\.io)/cargo\.")
+            .unwrap()
+            .expect("compiles");
+        assert!(lookbehind.regex.is_match("https://example.com/cargo."));
+        assert!(!lookbehind.regex.is_match("https://elo.io/cargo."));
+    }
+
+    #[test]
+    fn fallback_still_extracts_capture_groups() {
+        // Version extraction must work through the fallback engine too.
+        let p = TechnologyAnalyzer::compile_single_pattern(
+            r"leaflet-((?:\d+\.)+\d+)\.js(?!.+shopify)\;version:\1",
+        )
+        .unwrap()
+        .expect("compiles");
+        let caps = p.regex.captures("/js/leaflet-1.9.4.js").expect("should match");
+        assert_eq!(
+            TechnologyAnalyzer::extract_version(&p.version, &caps).as_deref(),
+            Some("1.9.4")
+        );
     }
 
     #[test]

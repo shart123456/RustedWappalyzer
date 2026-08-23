@@ -72,6 +72,7 @@ rayon = "1.0"
 
 # MongoDB client (VulnVault CVE enrichment)
 mongodb = "3"
+fancy-regex = "0.19.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

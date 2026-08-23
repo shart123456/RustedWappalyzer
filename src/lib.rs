@@ -590,7 +590,7 @@ mod tests {
     async fn test_version_extraction() {
         let pattern = Some("\\1".to_string());
         let regex = Regex::new(r"WordPress (\d+\.\d+)").unwrap();
-        let captures = regex.captures("WordPress 5.8").unwrap();
+        let captures = PatternCaptures::Fast(regex.captures("WordPress 5.8").unwrap());
 
         let version = TechnologyAnalyzer::extract_version(&pattern, &captures);
         assert_eq!(version, Some("5.8".to_string()));
@@ -682,26 +682,26 @@ mod tests {
 
     #[test]
     fn test_extract_version_none_template() {
-        let caps = Regex::new(r"(foo)").unwrap().captures("foo").unwrap();
+        let caps = PatternCaptures::Fast(Regex::new(r"(foo)").unwrap().captures("foo").unwrap());
         assert_eq!(TechnologyAnalyzer::extract_version(&None, &caps), None);
     }
 
     #[test]
     fn test_extract_version_empty_template_returns_none() {
-        let caps = Regex::new(r"(foo)").unwrap().captures("foo").unwrap();
+        let caps = PatternCaptures::Fast(Regex::new(r"(foo)").unwrap().captures("foo").unwrap());
         assert_eq!(TechnologyAnalyzer::extract_version(&Some(String::new()), &caps), None);
     }
 
     #[test]
     fn test_extract_version_ternary_matched() {
-        let caps = Regex::new(r"v(\d+)").unwrap().captures("v3").unwrap();
+        let caps = PatternCaptures::Fast(Regex::new(r"v(\d+)").unwrap().captures("v3").unwrap());
         let ver = TechnologyAnalyzer::extract_version(&Some(r"\1?major:fallback".to_string()), &caps);
         assert_eq!(ver, Some("major".to_string()));
     }
 
     #[test]
     fn test_extract_version_ternary_unmatched() {
-        let caps = Regex::new(r"v(\d+)(\.\d+)?").unwrap().captures("v3").unwrap();
+        let caps = PatternCaptures::Fast(Regex::new(r"v(\d+)(\.\d+)?").unwrap().captures("v3").unwrap());
         let ver = TechnologyAnalyzer::extract_version(&Some(r"\2?major:fallback".to_string()), &caps);
         assert_eq!(ver, Some("fallback".to_string()));
     }
