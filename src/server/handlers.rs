@@ -48,6 +48,23 @@ pub struct AnalyzeRequest {
     pub auto_escalate: Option<bool>,
 }
 
+/// Body for `POST /analyze-response` — a response the caller already fetched.
+#[derive(Deserialize)]
+pub struct AnalyzeResponseRequest {
+    /// The URL the response came from. Used for URL-pattern detections and echoed back.
+    pub url: String,
+    pub status_code: Option<u16>,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub body: String,
+    /// Raw `Set-Cookie` values. Pass them separately: collapsing several into one
+    /// header string loses the per-cookie boundaries the cookie layer matches on.
+    #[serde(default)]
+    pub set_cookie_headers: Vec<String>,
+    pub confidence: Option<u8>,
+}
+
 #[derive(Deserialize)]
 pub struct BatchRequest {
     pub urls: Vec<String>,
@@ -532,5 +549,77 @@ pub async fn batch(
         )
     }))
     .await;
+    HttpResponse::Ok().json(enriched)
+}
+
+/// Analyze a response the caller already fetched — no outbound request is made.
+///
+/// This is the passive counterpart to `/analyze`. A crawler, proxy, or recon pipeline
+/// that already has the headers and body can hand them over instead of making this
+/// server fetch the page a second time. No SSRF check is needed or performed, because
+/// nothing is requested; the `url` is only used for URL-pattern matching and is echoed
+/// back in the response.
+///
+/// Because no network access happens, the DNS, linked-asset, favicon, and endpoint-probe
+/// layers are skipped. Expect fewer technologies — and notably fewer versions — than
+/// `/analyze` returns for the same page, since many version strings live in linked JS.
+pub async fn analyze_response(
+    req: actix_web::HttpRequest,
+    data: web::Data<Arc<StandaloneWappalyzer>>,
+    vault: web::Data<Arc<Option<vuln::VulnVault>>>,
+    poc_vault: web::Data<Arc<Option<poc::PocVault>>>,
+    alert_vault: web::Data<Arc<Option<alert::AlertVault>>>,
+    rate_limiter: web::Data<crate::middleware::RateLimiter>,
+    api_key: web::Data<Option<String>>,
+    body: web::Json<AnalyzeResponseRequest>,
+) -> HttpResponse {
+    if let Err(resp) = check_auth_and_rate_limit(&req, &rate_limiter, &api_key) {
+        return resp;
+    }
+
+    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "URL must use http:// or https:// scheme"
+        }));
+    }
+
+    let confidence = body.confidence.unwrap_or(50);
+
+    // Header names are matched case-insensitively downstream, so normalize here rather
+    // than trusting whatever casing the caller's HTTP stack happened to preserve.
+    let headers = body
+        .headers
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+
+    let response = ::rusty_wappalyzer::HttpResponse {
+        url: body.url.clone(),
+        headers,
+        body: body.body.clone(),
+        status_code: body.status_code.unwrap_or(200),
+        response_time_ms: 0,
+        set_cookie_headers: body.set_cookie_headers.clone(),
+    };
+
+    let start = std::time::Instant::now();
+    let technologies = data.analyze_prefetched(&response, confidence);
+
+    let result = AnalysisResult {
+        url: body.url.clone(),
+        technologies,
+        analysis_time_ms: start.elapsed().as_millis() as u64,
+        response_info: None,
+        error: None,
+    };
+
+    let enriched = enrich_result(
+        result,
+        Arc::clone(vault.get_ref()),
+        Arc::clone(poc_vault.get_ref()),
+        Arc::clone(alert_vault.get_ref()),
+    )
+    .await;
+
     HttpResponse::Ok().json(enriched)
 }

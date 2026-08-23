@@ -184,6 +184,7 @@ pub(crate) fn configure_app(
             .route("/health", actix_web::web::get().to(handlers::health))
             .route("/info", actix_web::web::get().to(handlers::info))
             .route("/analyze", actix_web::web::post().to(handlers::analyze))
+            .route("/analyze-response", actix_web::web::post().to(handlers::analyze_response))
             .route("/batch", actix_web::web::post().to(handlers::batch))
             .route("/wayback", actix_web::web::post().to(handlers::wayback_analyze))
             // Unknown route / wrong method: answer with the same JSON envelope
@@ -605,5 +606,91 @@ mod http_tests {
             .await;
             assert_eq!(resp.status(), 400, "{url} must be rejected");
         }
+    }
+
+    #[actix_web::test]
+    async fn analyze_response_detects_from_a_prefetched_body_without_fetching() {
+        // The whole point of this endpoint: the caller already has the page, so a
+        // host that the SSRF pre-flight would block is still analyzable, because
+        // nothing is requested. If this ever starts making a request, BLOCKED_HOST
+        // will fail the SSRF check and the assertion below breaks.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let payload = serde_json::json!({
+            "url": "http://10.0.0.1/",
+            "status_code": 200,
+            "headers": { "server": "nginx/1.28.0" },
+            "body": "<html><head><meta name=\"generator\" content=\"WordPress 6.4.2\"></head></html>"
+        });
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze-response")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(payload.to_string())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "a prefetched body needs no SSRF check");
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let techs = body["technologies"].as_array().expect("technologies array");
+        let named: Vec<&str> = techs
+            .iter()
+            .filter_map(|t| t["technology"].as_str())
+            .collect();
+        assert!(named.contains(&"Nginx"), "expected Nginx from the header, got {named:?}");
+        assert!(named.contains(&"WordPress"), "expected WordPress from the meta tag, got {named:?}");
+
+        // The version must come from the supplied data, not from a live fetch.
+        let wp = techs
+            .iter()
+            .find(|t| t["technology"] == "WordPress")
+            .expect("WordPress entry");
+        assert_eq!(wp["version"], "6.4.2");
+    }
+
+    #[actix_web::test]
+    async fn analyze_response_rejects_non_http_url() {
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze-response")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(r#"{"url":"file:///etc/passwd","body":"<html></html>"}"#)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn analyze_response_normalizes_header_casing() {
+        // Callers hand us whatever casing their HTTP stack preserved; header
+        // matching downstream is lowercase-keyed.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let payload = serde_json::json!({
+            "url": "http://10.0.0.1/",
+            "headers": { "SeRvEr": "nginx/1.28.0" },
+            "body": ""
+        });
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/analyze-response")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(payload.to_string())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let named: Vec<&str> = body["technologies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["technology"].as_str())
+            .collect();
+        assert!(named.contains(&"Nginx"), "mixed-case header should still match, got {named:?}");
     }
 }

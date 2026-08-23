@@ -707,13 +707,16 @@ impl TechnologyAnalyzer {
         // Convert to Technology structs — confidence via Noisy-OR, filter by min_confidence
         detected_technologies
             .into_iter()
-            .filter_map(|(name, detection)| {
+            .filter_map(|(name, mut detection)| {
+                Self::dedupe_signals(&mut detection.signals);
                 let confidence = compute_noisy_or(&detection.signals);
                 if confidence < min_confidence { return None; }
                 let tech_def = self.database.technologies.get(&name);
                 let categories = self.get_technology_categories(&name);
-                let cpe = tech_def.and_then(|def| def.cpe.clone())
-                    .or_else(|| self.cpe_overrides.get(&name).cloned());
+                let cpe = Self::resolve_cpe(
+                    tech_def.and_then(|def| def.cpe.clone()),
+                    self.cpe_overrides.get(&name),
+                );
                 Some(Technology {
                     name,
                     confidence,
@@ -827,6 +830,115 @@ impl TechnologyAnalyzer {
         }
     }
 
+    /// Pick the CPE for a technology, honouring explicit suppressions.
+    ///
+    /// Normally the database CPE wins and `data/cpe_overrides.json` only fills gaps.
+    /// But several database CPEs point at an unrelated product that merely shares a
+    /// name — modern Angular mapped to `angularjs:angular`, the Lightbox JS library
+    /// mapped to a `lightbox_photo_gallery` plugin — and a wrong CPE is worse than
+    /// none, because it silently produces CVE matches for software that isn't there.
+    ///
+    /// An override value of `""` means "no trustworthy CPE exists for this name" and
+    /// takes precedence over the database. Non-empty overrides keep their original
+    /// fill-the-gap behaviour so existing entries are unaffected.
+    fn resolve_cpe(db_cpe: Option<String>, override_cpe: Option<&String>) -> Option<String> {
+        match override_cpe {
+            Some(o) if o.is_empty() => None,
+            Some(o) => db_cpe.or_else(|| Some(o.clone())),
+            None => db_cpe,
+        }
+    }
+
+    /// Clean up an extracted version string, or reject it entirely.
+    ///
+    /// Version patterns capture whatever the page happens to expose, and some sources
+    /// are badly behaved. Observed in the wild:
+    ///
+    /// - WordPress slider plugins stuff their entire marketing description into the
+    ///   generator tag: `"6.7.41 - responsive, Mobile-Friendly Slider Plugin for
+    ///   WordPress with comfortable drag and drop interface."`
+    /// - Asset filenames yield build hashes rather than versions:
+    ///   `"70e2b8fbf759cc1d2687"`.
+    ///
+    /// Both are worse than no version at all: they get written into reports and fed to
+    /// CVE lookups as if they were real. Salvage a leading version where one exists,
+    /// otherwise return `None`.
+    pub(crate) fn sanitize_version(raw: &str) -> Option<String> {
+        let mut candidate = raw.trim();
+
+        // "6.7.41 - responsive, Mobile-Friendly ..." => "6.7.41"
+        if let Some(idx) = candidate.find(" - ") {
+            candidate = candidate[..idx].trim_end();
+        }
+        // A version never contains whitespace. If prose follows a version-shaped head,
+        // keep the head; otherwise the whole value is unusable.
+        if let Some(idx) = candidate.find(char::is_whitespace) {
+            candidate = candidate[..idx].trim_end();
+        }
+        candidate = candidate.trim_matches(|c: char| c == ',' || c == ';' || c == '.');
+
+        if candidate.is_empty() || candidate.len() > 32 {
+            return None;
+        }
+        // Only version-ish characters. Rejects quotes, parens, slashes, and unicode prose.
+        if !candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '~' | ':'))
+        {
+            return None;
+        }
+        // Must contain at least one digit — drops captures like "min" or "latest".
+        if !candidate.chars().any(|c| c.is_ascii_digit()) {
+            // Keep short non-numeric labels the database uses deliberately (GA4, UA, v2).
+            if candidate.len() > 4 {
+                return None;
+            }
+        }
+        // A long run of hex with no separator is a build hash, not a version.
+        if candidate.len() >= 12
+            && !candidate.contains('.')
+            && candidate.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(candidate.to_string())
+    }
+
+    /// Collapse repeated evidence down to one Signal per `(signal_type, value)`.
+    ///
+    /// Detection layers append a Signal per regex *hit*, not per distinct pattern, so
+    /// a pattern matching 30 page elements produced 30 identical Signals. Two problems
+    /// followed: the signal list stopped being readable evidence (Adobe Experience
+    /// Manager reported 58 signals of which only ~25 were distinct, and Google Tag
+    /// Manager reported 50 that were nearly all the same HTML comment), and because
+    /// confidence is Noisy-OR *over the signal list*, re-observing one piece of
+    /// evidence inflated confidence as though it were independent corroboration.
+    ///
+    /// The highest weight seen for a given key wins, so collapsing never weakens a
+    /// detection. Note this can lower the computed confidence for technologies that
+    /// were previously relying on duplicates to clear `min_confidence` — that is the
+    /// intended correction, since one observation should count once.
+    fn dedupe_signals(signals: &mut Vec<Signal>) {
+        if signals.len() < 2 {
+            return;
+        }
+        let mut max_weight: HashMap<(String, String), u8> = HashMap::new();
+        for signal in signals.iter() {
+            let key = (signal.signal_type.clone(), signal.value.clone());
+            let entry = max_weight.entry(key).or_insert(signal.weight);
+            if signal.weight > *entry {
+                *entry = signal.weight;
+            }
+        }
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        signals.retain(|signal| seen.insert((signal.signal_type.clone(), signal.value.clone())));
+        for signal in signals.iter_mut() {
+            if let Some(weight) = max_weight.get(&(signal.signal_type.clone(), signal.value.clone())) {
+                signal.weight = *weight;
+            }
+        }
+    }
+
     /// Get categories for a technology
     fn get_technology_categories(&self, tech_name: &str) -> Vec<String> {
         if let Some(tech_def) = self.database.technologies.get(tech_name) {
@@ -850,7 +962,10 @@ impl TechnologyAnalyzer {
             description: tech_def.and_then(|d| d.description.clone()),
             icon: tech_def.and_then(|d| d.icon.clone()),
             cpe: tech_def.and_then(|d| d.cpe.clone())
-                .or_else(|| self.cpe_overrides.get(name).cloned()),
+                .map_or_else(
+                    || Self::resolve_cpe(None, self.cpe_overrides.get(name)),
+                    |c| Self::resolve_cpe(Some(c), self.cpe_overrides.get(name)),
+                ),
             saas: tech_def.and_then(|d| d.saas),
             pricing: tech_def.and_then(|d| d.pricing.clone()),
             signals: Vec::new(),
@@ -956,6 +1071,19 @@ impl TechnologyAnalyzer {
     /// "Trident AB" (`requires: Shopify`) re-matching `Trident/` inside a
     /// vendor JS UA-sniff block fetched by `inspect_assets`.
     pub fn finalize_gating(&self, technologies: &mut Vec<Technology>) {
+        // Late-stage layers (assets, source maps, favicon, probes, DNS) merge their
+        // findings with `signals.extend(..)`, which re-appends evidence the initial
+        // pass already recorded — one asset scanned per linked file, each re-matching
+        // the same handful of patterns. Collapse here, after every layer has merged,
+        // so the emitted signal list is distinct evidence rather than a hit counter.
+        for tech in technologies.iter_mut() {
+            Self::dedupe_signals(&mut tech.signals);
+            // Drop or trim versions that aren't versions (plugin blurbs, build hashes).
+            if let Some(raw) = tech.version.take() {
+                tech.version = Self::sanitize_version(&raw);
+            }
+        }
+
         let mut detected: HashMap<String, TechDetection> = technologies
             .iter()
             .map(|t| (
@@ -982,6 +1110,71 @@ mod tests {
 
     fn make_signal(weight: u8) -> Signal {
         Signal { signal_type: "html".to_string(), value: "test".to_string(), weight }
+    }
+
+    #[test]
+    fn test_sanitize_version_strips_plugin_blurbs() {
+        // Slider Revolution / LayerSlider put their whole description in the version.
+        assert_eq!(
+            TechnologyAnalyzer::sanitize_version(
+                "6.7.41 - responsive, Mobile-Friendly Slider Plugin for WordPress with comfortable drag and drop interface."
+            ),
+            Some("6.7.41".to_string())
+        );
+        assert_eq!(
+            TechnologyAnalyzer::sanitize_version(
+                "8.2.0 - Build Heros, Sliders, and Popups. Create Animations and Beautiful, Rich Web Content"
+            ),
+            Some("8.2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_version_rejects_build_hashes() {
+        // Observed on Bootstrap: an asset filename hash captured as a version.
+        assert_eq!(TechnologyAnalyzer::sanitize_version("70e2b8fbf759cc1d2687"), None);
+        // A dotted version of similar length is still fine.
+        assert_eq!(
+            TechnologyAnalyzer::sanitize_version("2016.1.112"),
+            Some("2016.1.112".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sanitize_version_keeps_real_versions() {
+        for v in ["1.28.0", "5.3.3", "6.x", "3.7.1", "1.1.1k", "2.0.50727", "v2", "GA4", "UA"] {
+            assert_eq!(
+                TechnologyAnalyzer::sanitize_version(v),
+                Some(v.to_string()),
+                "should have kept {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_version_rejects_junk() {
+        assert_eq!(TechnologyAnalyzer::sanitize_version(""), None);
+        assert_eq!(TechnologyAnalyzer::sanitize_version("   "), None);
+        assert_eq!(TechnologyAnalyzer::sanitize_version("latest"), None);
+        assert_eq!(TechnologyAnalyzer::sanitize_version("minified"), None);
+        // over the length cap
+        assert_eq!(TechnologyAnalyzer::sanitize_version(&"1".repeat(40)), None);
+    }
+
+    #[test]
+    fn test_dedupe_signals_collapses_repeats_and_keeps_max_weight() {
+        let mut signals = vec![
+            Signal { signal_type: "html".into(), value: "aem-Grid".into(), weight: 75 },
+            Signal { signal_type: "html".into(), value: "aem-Grid".into(), weight: 100 },
+            Signal { signal_type: "html".into(), value: "aem-Grid".into(), weight: 50 },
+            Signal { signal_type: "script".into(), value: "aem-Grid".into(), weight: 100 },
+        ];
+        TechnologyAnalyzer::dedupe_signals(&mut signals);
+        assert_eq!(signals.len(), 2, "identical (type,value) pairs should collapse");
+        let html = signals.iter().find(|s| s.signal_type == "html").unwrap();
+        assert_eq!(html.weight, 100, "the strongest weight should survive");
+        // a different signal_type with the same value is distinct evidence
+        assert!(signals.iter().any(|s| s.signal_type == "script"));
     }
 
     #[test]
