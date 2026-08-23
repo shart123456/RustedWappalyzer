@@ -135,6 +135,8 @@ pub struct TechnologyAnalyzer {
     pub(crate) js_patterns: HashMap<String, Vec<CompiledJsPattern>>,
     /// Supplemental CPE overrides: tech name → CPE string, from data/cpe_overrides.json.
     pub(crate) cpe_overrides: HashMap<String, String>,
+    /// Lowercase alias → canonical technology name, from data/tech_aliases.json.
+    pub(crate) tech_aliases: HashMap<String, String>,
     /// Version extraction patches: tech name → field name → pattern value.
     /// Added at compile time for Segment C technologies (CPE present, version pattern missing).
     pub(crate) version_patches: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -161,6 +163,7 @@ impl TechnologyAnalyzer {
         let favicon_hashes = cache::load_favicon_hashes();
         let cpe_overrides = cache::load_cpe_overrides();
         let version_patches = cache::load_version_patches();
+        let tech_aliases = cache::load_tech_aliases();
         let mut analyzer = Self {
             database,
             html_patterns: HashMap::new(),
@@ -177,6 +180,7 @@ impl TechnologyAnalyzer {
             dns_patterns: HashMap::new(),
             js_patterns: HashMap::new(),
             cpe_overrides,
+            tech_aliases,
             version_patches,
             implies_graph: HashMap::new(),
             dom_rules: HashMap::new(),
@@ -1128,7 +1132,58 @@ impl TechnologyAnalyzer {
     /// can re-introduce techs whose dependencies were filtered out, e.g.
     /// "Trident AB" (`requires: Shopify`) re-matching `Trident/` inside a
     /// vendor JS UA-sniff block fetched by `inspect_assets`.
+    /// Fold technologies that are the same product under different names into one.
+    ///
+    /// The Wappalyzer database lists some products more than once — "All in One SEO"
+    /// and "All in One SEO Pack" are one plugin renamed — so a single installation was
+    /// reported as two or three separate technologies, each with its own signals.
+    ///
+    /// Signals are concatenated (deduped immediately afterwards by the caller), the
+    /// highest confidence wins, and a version is taken from the alias only when the
+    /// canonical entry does not already have one.
+    fn merge_aliases(&self, technologies: &mut Vec<Technology>) {
+        if self.tech_aliases.is_empty() {
+            return;
+        }
+        // alias name -> canonical name, for the entries actually present
+        let mut to_merge: Vec<(usize, String)> = Vec::new();
+        for (idx, tech) in technologies.iter().enumerate() {
+            if let Some(canonical) = self.tech_aliases.get(&tech.name.to_lowercase()) {
+                to_merge.push((idx, canonical.clone()));
+            }
+        }
+        if to_merge.is_empty() {
+            return;
+        }
+
+        // Drain highest index first so the remaining indices stay valid.
+        for (idx, canonical) in to_merge.into_iter().rev() {
+            let alias = technologies.remove(idx);
+            match technologies.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&canonical)) {
+                Some(target) => {
+                    target.signals.extend(alias.signals);
+                    target.confidence = target.confidence.max(alias.confidence);
+                    if target.version.is_none() {
+                        target.version = alias.version;
+                    }
+                }
+                None => {
+                    // Canonical entry absent: rename in place rather than dropping the
+                    // detection, and rebuild the metadata so categories/CPE match the
+                    // canonical name instead of the alias.
+                    let mut renamed = self.build_technology(&canonical, alias.confidence, alias.version);
+                    renamed.signals = alias.signals;
+                    technologies.push(renamed);
+                }
+            }
+        }
+    }
+
     pub fn finalize_gating(&self, technologies: &mut Vec<Technology>) {
+        // Fold duplicate names for one product into a single entry before anything else,
+        // so signal dedup and gating see one technology rather than two or three.
+        self.merge_aliases(technologies);
+
         // Late-stage layers (assets, source maps, favicon, probes, DNS) merge their
         // findings with `signals.extend(..)`, which re-appends evidence the initial
         // pass already recorded — one asset scanned per linked file, each re-matching
@@ -1164,6 +1219,51 @@ mod tests {
 
     fn make_detection(signals: Vec<Signal>) -> TechDetection {
         TechDetection { version: None, signals }
+    }
+
+/// A TechnologyAnalyzer with everything empty, for testing instance methods that
+    /// only touch one field. Cheaper and more predictable than loading the database.
+    fn empty_analyzer() -> TechnologyAnalyzer {
+        TechnologyAnalyzer {
+            database: WappalyzerDatabase {
+                technologies: HashMap::new(),
+                categories: HashMap::new(),
+            },
+            html_patterns: HashMap::new(),
+            header_patterns: HashMap::new(),
+            url_patterns: HashMap::new(),
+            script_patterns: HashMap::new(),
+            inline_script_patterns: HashMap::new(),
+            meta_patterns: HashMap::new(),
+            css_patterns: HashMap::new(),
+            cookie_patterns: HashMap::new(),
+            name_index: HashMap::new(),
+            category_name_map: HashMap::new(),
+            favicon_hashes: HashMap::new(),
+            dns_patterns: HashMap::new(),
+            js_patterns: HashMap::new(),
+            cpe_overrides: HashMap::new(),
+            tech_aliases: HashMap::new(),
+            version_patches: HashMap::new(),
+            implies_graph: HashMap::new(),
+            dom_rules: HashMap::new(),
+        }
+    }
+
+    fn make_tech(name: &str) -> Technology {
+        Technology {
+            name: name.to_string(),
+            confidence: 100,
+            version: None,
+            categories: vec![],
+            website: None,
+            description: None,
+            icon: None,
+            cpe: None,
+            saas: None,
+            pricing: None,
+            signals: vec![],
+        }
     }
 
     fn make_signal(weight: u8) -> Signal {
@@ -1233,6 +1333,97 @@ mod tests {
         assert_eq!(html.weight, 100, "the strongest weight should survive");
         // a different signal_type with the same value is distinct evidence
         assert!(signals.iter().any(|s| s.signal_type == "script"));
+    }
+
+
+    #[test]
+    fn test_merge_aliases_folds_duplicates_into_one_entry() {
+        // "All in One SEO" and "All in One SEO Pack" are one plugin under its old and
+        // new database names, so one installation was reported as two technologies.
+        let mut analyzer = empty_analyzer();
+        analyzer
+            .tech_aliases
+            .insert("all in one seo pack".to_string(), "All in One SEO".to_string());
+
+        let mut techs = vec![
+            Technology {
+                name: "All in One SEO".into(),
+                confidence: 90,
+                version: None,
+                categories: vec![],
+                website: None,
+                description: None,
+                icon: None,
+                cpe: None,
+                saas: None,
+                pricing: None,
+                signals: vec![Signal { signal_type: "html".into(), value: "a".into(), weight: 90 }],
+            },
+            Technology {
+                name: "All in One SEO Pack".into(),
+                confidence: 100,
+                version: Some("5.0.0.1".into()),
+                categories: vec![],
+                website: None,
+                description: None,
+                icon: None,
+                cpe: None,
+                saas: None,
+                pricing: None,
+                signals: vec![Signal { signal_type: "script".into(), value: "b".into(), weight: 100 }],
+            },
+        ];
+
+        analyzer.merge_aliases(&mut techs);
+
+        assert_eq!(techs.len(), 1, "the alias should have folded into the canonical entry");
+        let merged = &techs[0];
+        assert_eq!(merged.name, "All in One SEO");
+        assert_eq!(merged.confidence, 100, "the higher confidence should win");
+        assert_eq!(merged.version.as_deref(), Some("5.0.0.1"), "version taken from the alias");
+        assert_eq!(merged.signals.len(), 2, "signals from both entries should survive");
+    }
+
+    #[test]
+    fn test_merge_aliases_renames_when_canonical_is_absent() {
+        // Only the alias was detected: rename rather than drop the detection.
+        let mut analyzer = empty_analyzer();
+        analyzer
+            .tech_aliases
+            .insert("aioseo".to_string(), "All in One SEO".to_string());
+
+        let mut techs = vec![Technology {
+            name: "AIOSEO".into(),
+            confidence: 75,
+            version: Some("5.0".into()),
+            categories: vec![],
+            website: None,
+            description: None,
+            icon: None,
+            cpe: None,
+            saas: None,
+            pricing: None,
+            signals: vec![Signal { signal_type: "html".into(), value: "x".into(), weight: 75 }],
+        }];
+
+        analyzer.merge_aliases(&mut techs);
+        assert_eq!(techs.len(), 1);
+        assert_eq!(techs[0].name, "All in One SEO");
+        assert_eq!(techs[0].version.as_deref(), Some("5.0"));
+        assert_eq!(techs[0].signals.len(), 1, "the detection must not be lost");
+    }
+
+    #[test]
+    fn test_merge_aliases_leaves_unrelated_names_alone() {
+        // "HashThemes Total" and "Total WordPress Theme" share a word but are different
+        // products. Merging them would be worse than reporting both.
+        let analyzer = empty_analyzer();
+        let mut techs = vec![
+            make_tech("HashThemes Total"),
+            make_tech("Total WordPress Theme"),
+        ];
+        analyzer.merge_aliases(&mut techs);
+        assert_eq!(techs.len(), 2, "distinct products must not be merged");
     }
 
     #[test]
