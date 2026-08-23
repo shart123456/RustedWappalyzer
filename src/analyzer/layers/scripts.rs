@@ -7,6 +7,43 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+/// Is a version captured from a URL path plausibly *this* library's version?
+///
+/// The CDN heuristic assumes a `/<version>/` path segment belongs to the library
+/// named in the URL. That holds for real CDN layouts, where the two are adjacent:
+///
+///   cdnjs.cloudflare.com/ajax/libs/react/18.3.1/react.min.js
+///   unpkg.com/react@18.3.1/umd/react.production.min.js
+///   cdn.example.com/5.6.1/react.min.js
+///
+/// It breaks when a vendor serves its own versioned product path and happens to
+/// name a chunk after the library:
+///
+///   kubra.io/product/5.53.3/static/js/react.chunk.js
+///
+/// Here `5.53.3` is the vendor's product version, and attributing it to React
+/// produced "React 5.53.3" — a release React has never had, which then went on to
+/// be used for CVE lookups. Require the keyword and the version to sit next to
+/// each other, separated by at most a delimiter or two.
+fn version_is_adjacent_to_keyword(url_lower: &str, keyword: &str, ver_start: usize, ver_end: usize) -> bool {
+    const MAX_GAP: usize = 2; // "/", "@", "-", "/v", etc.
+    let mut from = 0usize;
+    while let Some(rel) = url_lower[from..].find(keyword) {
+        let k_start = from + rel;
+        let k_end = k_start + keyword.len();
+        // keyword before version:  .../react/18.3.1/...
+        if k_end <= ver_start && ver_start - k_end <= MAX_GAP {
+            return true;
+        }
+        // version before keyword:  .../18.3.1/react.min.js
+        if ver_end <= k_start && k_start - ver_end <= MAX_GAP {
+            return true;
+        }
+        from = k_start + 1;
+    }
+    false
+}
+
 impl TechnologyAnalyzer {
     /// Analyze script tags in HTML
     pub(crate) fn analyze_scripts(&self, html: &str, detected: &mut HashMap<String, TechDetection>) {
@@ -277,8 +314,11 @@ impl TechnologyAnalyzer {
                 // CDN version from URL path
                 if let Some(ver_cap) = CSS_CDN_URL_RE.captures(url) {
                     let ver = ver_cap[1].to_string();
+                    let m = ver_cap.get(1).expect("group 1 matched");
                     for (keyword, tech_name) in CSS_CDN_MAP {
-                        if url_lower.contains(keyword) {
+                        if url_lower.contains(keyword)
+                            && version_is_adjacent_to_keyword(&url_lower, keyword, m.start(), m.end())
+                        {
                             if let Some(db_name) = self.find_tech_name(tech_name) {
                                 Self::update_detection(detected, db_name, "script_src", url, 100, Some(ver.clone()));
                             }
@@ -425,10 +465,15 @@ impl TechnologyAnalyzer {
         let url_lower = asset_url.to_lowercase();
         if let Some(ver_cap) = CDN_URL_RE.captures(asset_url) {
             let ver = ver_cap[1].to_string();
+            let m = ver_cap.get(1).expect("group 1 matched");
             for (keyword, tech_name) in CDN_MAP {
                 if url_lower.contains(keyword) {
-                    if let Some(db_name) = self.find_tech_name(tech_name) {
-                        Self::update_detection(detected, db_name, "script_src", &format!("banner:{}", db_name), 100, Some(ver.clone()));
+                    // Only trust the version when it sits next to the library name in the
+                    // URL; otherwise it belongs to something else on the path.
+                    if version_is_adjacent_to_keyword(&url_lower, keyword, m.start(), m.end()) {
+                        if let Some(db_name) = self.find_tech_name(tech_name) {
+                            Self::update_detection(detected, db_name, "script_src", &format!("banner:{}", db_name), 100, Some(ver.clone()));
+                        }
                     }
                     break;
                 }
@@ -447,13 +492,32 @@ impl TechnologyAnalyzer {
             static REACT_VER_RE2: Lazy<Regex> = Lazy::new(|| {
                 Regex::new(r#"exports\.version=["'](\d+\.\d+\.\d+)["']"#).unwrap()
             });
+            // React internals that a bundle containing React will carry. Deliberately
+            // internal-ish names: "react" alone appears in unrelated packages' strings,
+            // and useState/createElement are re-exported by wrappers.
+            static REACT_MARKER_RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(
+                    r"react-dom|__REACT_DEVTOOLS_GLOBAL_HOOK__|ReactCurrentOwner|ReactCurrentDispatcher|react\.element|react\.fragment"
+                ).unwrap()
+            });
             if url_lower.contains("react") || url_lower.contains("framework") || url_lower.contains("vendor") {
                 let react_db = self.find_tech_name("react");
                 if let Some(db_name) = react_db {
                     if let Some(cap) = REACT_VER_RE.captures(content) {
+                        // Anchored on useTransition within 200 chars — React-specific, safe anywhere.
                         Self::update_detection(detected, db_name, "script_src", &format!("banner:{}", db_name), 100, Some(cap[1].to_string()));
                     } else if let Some(cap) = REACT_VER_RE2.captures(content) {
-                        Self::update_detection(detected, db_name, "script_src", &format!("banner:{}", db_name), 100, Some(cap[1].to_string()));
+                        // `exports.version=` is generic: every UMD package sets it. A vendor or
+                        // framework bundle contains many packages, so whichever one happened to
+                        // set it was being reported as React's version — that is where
+                        // "React 5.53.3" came from, a version React has never had.
+                        //
+                        // Only trust it when the bundle actually contains React. This mirrors
+                        // the guard the Next.js branch below already applies to the same
+                        // generic pattern.
+                        if REACT_MARKER_RE.is_match(content) {
+                            Self::update_detection(detected, db_name, "script_src", &format!("banner:{}", db_name), 100, Some(cap[1].to_string()));
+                        }
                     }
                 }
             }
@@ -860,5 +924,60 @@ impl TechnologyAnalyzer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cdn_version_tests {
+    use super::version_is_adjacent_to_keyword;
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    static CDN_VER: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"[/@]v?(\d+\.\d+(?:\.\d+)?)(?:[/@]|\.min\.js|\.js|$)").unwrap());
+
+    fn adjacent(url: &str, keyword: &str) -> bool {
+        let lower = url.to_lowercase();
+        let cap = CDN_VER.captures(url).expect("a version should be present");
+        let m = cap.get(1).unwrap();
+        version_is_adjacent_to_keyword(&lower, keyword, m.start(), m.end())
+    }
+
+    #[test]
+    fn real_cdn_layouts_are_accepted() {
+        // keyword immediately before the version
+        assert!(adjacent(
+            "https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/react.min.js",
+            "react"
+        ));
+        assert!(adjacent("https://unpkg.com/react@18.3.1/umd/react.production.min.js", "react"));
+        // version immediately before the keyword
+        assert!(adjacent("https://cdn.example.com/5.6.1/react.min.js", "react"));
+        assert!(adjacent("https://cdn.example.com/libs/3.7.1/jquery.min.js", "jquery"));
+    }
+
+    #[test]
+    fn vendor_product_version_is_rejected() {
+        // Regression: 5.53.3 is Kubra's product version, not React's. Attributing it
+        // produced "React 5.53.3", a release React has never had, which then reached
+        // CVE lookups as though it were real.
+        assert!(!adjacent(
+            "https://kubra.io/product/5.53.3/static/js/react.chunk.js",
+            "react"
+        ));
+        // Same shape for a vendor bundle naming another library.
+        assert!(!adjacent(
+            "https://cdn.example.com/app/2.14.0/assets/js/bootstrap-shim.js",
+            "bootstrap"
+        ));
+    }
+
+    #[test]
+    fn repeated_keyword_uses_the_nearest_occurrence() {
+        // "react" appears twice; the one adjacent to the version is what matters.
+        assert!(adjacent(
+            "https://cdn.example.com/react/18.3.1/react.production.min.js",
+            "react"
+        ));
     }
 }

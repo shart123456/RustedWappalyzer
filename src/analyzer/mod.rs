@@ -1427,6 +1427,28 @@ mod tests {
     }
 
     #[test]
+    fn test_react_marker_is_required_for_generic_exports_version() {
+        // Regression: `exports.version=` is generic — every UMD package sets it. A
+        // vendor bundle contains many packages, and whichever one set it was reported
+        // as React's version, producing "React 5.53.3" (never a real React release).
+        // The guard is that the bundle must actually contain React internals.
+        let marker = regex::Regex::new(
+            r"react-dom|__REACT_DEVTOOLS_GLOBAL_HOOK__|ReactCurrentOwner|ReactCurrentDispatcher|react\.element|react\.fragment"
+        ).unwrap();
+
+        // A vendor bundle whose version belongs to some unrelated package.
+        let unrelated = r#"var x={};exports.version="5.53.3";module.exports=x;"#;
+        assert!(
+            !marker.is_match(unrelated),
+            "an unrelated bundle must not satisfy the React marker"
+        );
+
+        // A genuine React bundle.
+        let real_react = r#"var ReactCurrentOwner={current:null};exports.version="18.3.1";"#;
+        assert!(marker.is_match(real_react), "a real React bundle must satisfy the marker");
+    }
+
+    #[test]
     fn test_excludes_removes_excluded_tech() {
         // Build a minimal in-memory database
         let mut technologies = HashMap::new();
