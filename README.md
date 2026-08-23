@@ -80,6 +80,43 @@ curl -X POST http://localhost:3000/batch \
 
 ---
 
+### Analyze a Pre-fetched Response
+
+Already have the page? Hand over the headers and body and nothing is requested — this
+endpoint makes **no outbound connection**. Useful for crawlers, proxies, and recon
+pipelines that would otherwise make the server fetch a page they already hold.
+
+```bash
+curl -X POST http://localhost:3000/analyze-response \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "url": "https://example.com",
+        "status_code": 200,
+        "headers": {"server": "nginx/1.28.0"},
+        "body": "<html>...</html>"
+      }'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `url` | yes | Where the response came from. Used for URL-pattern detections and echoed back. Must be `http://` or `https://` |
+| `body` | no | Response body. Defaults to empty |
+| `headers` | no | Response headers. Matched case-insensitively |
+| `status_code` | no | Defaults to `200` |
+| `set_cookie_headers` | no | Raw `Set-Cookie` values as an array — pass them separately, since collapsing them into one string loses the per-cookie boundaries the cookie layer matches on |
+| `confidence` | no | Minimum confidence to report. Defaults to `50` |
+
+The response shape is identical to `/analyze`, CVE/PoC/KEV enrichment included.
+
+> **Expect fewer results than `/analyze`.** No request is made, so the layers that need
+> network access are skipped: DNS records, linked-asset inspection, favicon hashing and
+> well-known endpoint probes. Versions are the most visible casualty — many live in
+> linked JavaScript rather than the HTML, so libraries like jQuery and Bootstrap are
+> often detected without a version here. No SSRF check is performed or needed, because
+> nothing is fetched.
+
+---
+
 ### Wayback Comparison
 
 Compare the current tech stack against historical Wayback Machine snapshots (~1 year and ~2 years ago).
@@ -284,7 +321,7 @@ the public one; the private address is filtered out and never dialled.
 
 **Response body cap** — Fetched pages are truncated at 10 MB to prevent memory exhaustion from abnormally large responses.
 
-**Rate limiting** — 600 requests/minute per IP by default (sliding window), enforced server-side on `/analyze`, `/batch` and `/wayback`. `/health` and `/info` are exempt. Excess requests receive `HTTP 429`. See [Rate Limiting](#rate-limiting) for the environment variables.
+**Rate limiting** — 600 requests/minute per IP by default (sliding window), enforced server-side on `/analyze`, `/analyze-response`, `/batch` and `/wayback`. `/health` and `/info` are exempt. Excess requests receive `HTTP 429`. See [Rate Limiting](#rate-limiting) for the environment variables.
 
 **API key auth** — Optional bearer token via `API_KEY` env var. Comparison is constant-time to prevent timing attacks.
 
@@ -354,7 +391,7 @@ src/
       probes.rs    — Well-known endpoint probing (/package.json, /wp-json/, /healthz, …)
   server/
     mod.rs         — Actix-web server setup, app_data wiring, background cache refresh
-    handlers.rs    — /analyze, /batch, /wayback, /health, /info endpoints
+    handlers.rs    — /analyze, /analyze-response, /batch, /wayback, /health, /info endpoints
     cache.rs       — Hot-URL tracker; background auto-refresh loop (moka, 60s TTL)
 ```
 

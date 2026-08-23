@@ -57,12 +57,12 @@
   "Flowplayer": "cpe:2.3:a:flowplayer:flowplayer_flash:*:*:*:*:*:*:*:*",
   "Forgejo": "cpe:2.3:a:forgejo:forgejo:*:*:*:*:*:*:*:*",
   "Froala Editor": "cpe:2.3:a:froala:froala_editor:*:*:*:*:*:*:*:*",
-  "FullCalendar": "cpe:2.3:a:pixelite:wp_fullcalendar:*:*:*:*:*:wordpress:*:*",
+  "FullCalendar": "",
   "Fusion Ads": "cpe:2.3:a:vmware:fusion:*:*:*:*:*:*:*:*",
   "GPT AI Power": "cpe:2.3:a:gptaipower:gpt_ai_power:*:*:*:*:*:wordpress:*:*",
   "Gallery": "cpe:2.3:a:menalto:gallery:*:*:*:*:*:*:*:*",
   "GeneratePress": "cpe:2.3:a:generatepress:generatepress:*:*:*:*:-:wordpress:*:*",
-  "Google Analytics": "cpe:2.3:a:bestwebsoft:google_analytics:*:*:*:*:*:wordpress:*:*",
+  "Google Analytics": "",
   "Google Maps": "cpe:2.3:a:mapsplugin:googlemaps:*:*:*:*:*:joomla\\!:*:*",
   "Google Tag Manager for WordPress": "cpe:2.3:a:gtm4wp:google_tag_manager:*:*:*:*:*:wordpress:*:*",
   "Gravity": "cpe:2.3:a:creolabs:gravity:*:*:*:*:*:*:*:*",
@@ -73,7 +73,7 @@
   "HurryTimer": "cpe:2.3:a:nabillemsieh:hurrytimer:*:*:*:*:*:wordpress:*:*",
   "Imunify360": "cpe:2.3:a:cloudlinux:imunify360:*:*:*:*:*:*:*:*",
   "Indico": "cpe:2.3:a:cern:indico:*:*:*:*:*:*:*:*",
-  "Infinite Scroll": "cpe:2.3:a:studio.gd:gd_infinite_scroll:*:*:*:*:*:drupal:*:*",
+  "Infinite Scroll": "",
   "Invenio": "cpe:2.3:a:inveniosoftware:invenio-app:*:-:*:*:*:*:*:*",
   "Ivory Search": "cpe:2.3:a:ivorysearch:ivory_search:*:*:*:*:*:wordpress:*:*",
   "KaTeX": "cpe:2.3:a:katex:katex:*:*:*:*:*:*:*:*",
@@ -185,5 +185,8 @@
   "imperia CMS": "cpe:2.3:a:imperial_cms_project:imperial_cms:*:*:*:*:*:*:*:*",
   "jQuery Modal": "cpe:2.3:a:rubyonrails:jquery-rails:*:*:*:*:*:*:*:*",
   "mod_dav": "cpe:2.3:a:apache:mod_dav_svn:*:*:*:*:*:*:*:*",
-  "mod_jk": "cpe:2.3:a:apache:mod_jk:*:*:*:*:*:*:*:*"
+  "mod_jk": "cpe:2.3:a:apache:mod_jk:*:*:*:*:*:*:*:*",
+  "Angular": "",
+  "Lightbox": "",
+  "React": ""
 }

@@ -86,6 +86,24 @@ impl StandaloneWappalyzer {
         self.config.max_batch_size
     }
 
+    /// Analyze a response the caller already fetched, without touching the network.
+    ///
+    /// This exists for callers that have the page in hand — a crawler, a proxy, a
+    /// recon pipeline — and would otherwise have to make us fetch it a second time.
+    /// Because nothing is requested, the layers that need network access are skipped:
+    /// no DNS records, no linked-asset inspection, no favicon hashing, and no
+    /// well-known endpoint probes. Expect fewer technologies and notably fewer
+    /// extracted versions than `analyze_url`, since a lot of version strings live in
+    /// linked JS rather than the HTML itself.
+    ///
+    /// The final exclude/require gate still runs, so results stay consistent with the
+    /// fetching path for the layers that do apply.
+    pub fn analyze_prefetched(&self, response: &HttpResponse, min_confidence: u8) -> Vec<Technology> {
+        let mut technologies = self.analyzer.analyze(response, min_confidence);
+        self.analyzer.finalize_gating(&mut technologies);
+        technologies
+    }
+
     /// Pre-warm regex compilation by running a trivial analysis against a synthetic response.
     /// Call once at server startup to avoid first-request latency spikes.
     pub async fn warm_up(&self) {
@@ -507,6 +525,10 @@ impl StandaloneWappalyzer {
                         full_scan,
                     ).await;
                 }
+                // Same final gate as the single-URL path. Without this, /batch skipped
+                // exclude/require post-processing entirely and returned a different
+                // technology list than /analyze for the very same URL.
+                analyzer.finalize_gating(&mut technologies);
                 AnalysisResult {
                     url: url.to_string(),
                     technologies,
