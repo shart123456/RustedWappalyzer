@@ -32,6 +32,13 @@ const FAVICON_HASHES_JSON: &str = include_str!("../data/favicon_hashes.json");
 /// the DB has no CPE but never overrides a CPE that the DB already provides.
 const CPE_OVERRIDES_JSON: &str = include_str!("../data/cpe_overrides.json");
 
+/// Technology name aliases embedded at compile time (data/tech_aliases.json).
+///
+/// The Wappalyzer database lists some products more than once — "All in One SEO"
+/// and "All in One SEO Pack" are the same plugin under its old and new names — so a
+/// single installation is reported as two or three technologies.
+const TECH_ALIASES_JSON: &str = include_str!("../data/tech_aliases.json");
+
 /// Supplemental version extraction patches embedded at compile time (data/version_patches.json).
 /// Maps tech name → field name → pattern value, adding version extraction to Segment C
 /// technologies that have a CPE but no version pattern in the upstream database.
@@ -66,6 +73,43 @@ pub(crate) fn load_cpe_overrides() -> HashMap<String, String> {
             HashMap::new()
         }
     }
+}
+
+/// Load technology name aliases from the embedded JSON blob.
+///
+/// Returns a lowercase-keyed map so lookups are case-insensitive. Keys beginning
+/// with `_` are documentation, not aliases. An alias pointing at another alias is
+/// dropped rather than resolved: a chain is a mistake in the data, and silently
+/// following it would hide it.
+pub(crate) fn load_tech_aliases() -> HashMap<String, String> {
+    let raw: HashMap<String, String> = match serde_json::from_str(TECH_ALIASES_JSON) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Failed to parse technology aliases: {} — alias merging disabled", e);
+            return HashMap::new();
+        }
+    };
+    let canonical: std::collections::HashSet<String> = raw
+        .iter()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .map(|(_, v)| v.to_lowercase())
+        .collect();
+    let mut map = HashMap::new();
+    for (alias, target) in raw {
+        if alias.starts_with('_') {
+            continue;
+        }
+        let alias_lc = alias.to_lowercase();
+        if canonical.contains(&alias_lc) {
+            tracing::warn!(alias = %alias, "Alias is itself an alias target; skipping to avoid a chain");
+            continue;
+        }
+        map.insert(alias_lc, target);
+    }
+    if !map.is_empty() {
+        tracing::info!(count = map.len(), "Technology aliases loaded");
+    }
+    map
 }
 
 /// Load version extraction patches from the embedded JSON blob.

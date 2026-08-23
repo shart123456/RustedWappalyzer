@@ -1,0 +1,10 @@
+{
+  "_comment": "Alias -> canonical name, for products the Wappalyzer database lists more than once. Only for entries that are genuinely the same product: merging two products that merely share a name would be worse than the duplicate. Keys are matched case-insensitively.",
+
+  "All in One SEO Pack": "All in One SEO",
+  "All in One SEO (AIOSEO)": "All in One SEO",
+  "AIOSEO": "All in One SEO",
+
+  "Powered by Slider Revolution": "Slider Revolution",
+  "Slider Revolution (revslider)": "Slider Revolution"
+}
