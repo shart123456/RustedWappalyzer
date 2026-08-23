@@ -134,9 +134,83 @@ pub struct AnalysisResult {
 /// Technology detection pattern
 #[derive(Debug, Clone)]
 pub struct CompiledPattern {
-    pub regex: Regex,
+    pub regex: PatternRegex,
     pub confidence: u8,
     pub version: Option<String>,
+}
+
+/// A compiled pattern, backed by whichever engine can handle it.
+///
+/// The `regex` crate rejects look-around by design, and the Wappalyzer database uses
+/// it — a dozen patterns were dropped at startup, silently narrowing detection for the
+/// technologies that relied on them (Leaflet, Vue, Drupal, AngularJS, Yotpo, Acquire,
+/// Aniview, jQuery and a handful of others). `fancy-regex` supports look-around via
+/// backtracking, so it serves as a fallback for exactly those patterns.
+///
+/// `regex` stays the default because it is the faster engine and guarantees linear
+/// time; only patterns it cannot compile fall through to the backtracking one.
+#[derive(Debug, Clone)]
+pub enum PatternRegex {
+    /// Linear-time engine — the common case.
+    Fast(Regex),
+    /// Backtracking engine, used only for patterns requiring look-around.
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+impl PatternRegex {
+    pub fn is_match(&self, text: &str) -> bool {
+        match self {
+            PatternRegex::Fast(r) => r.is_match(text),
+            // A backtracking match can fail (backtrack limit); treat that as "no match"
+            // rather than panicking on a pathological input.
+            PatternRegex::Fancy(r) => r.is_match(text).unwrap_or(false),
+        }
+    }
+
+    pub fn captures<'t>(&self, text: &'t str) -> Option<PatternCaptures<'t>> {
+        match self {
+            PatternRegex::Fast(r) => r.captures(text).map(PatternCaptures::Fast),
+            PatternRegex::Fancy(r) => match r.captures(text) {
+                Ok(Some(c)) => Some(PatternCaptures::Fancy(c)),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            PatternRegex::Fast(r) => r.as_str(),
+            PatternRegex::Fancy(r) => r.as_str(),
+        }
+    }
+}
+
+/// Capture groups from either engine.
+pub enum PatternCaptures<'t> {
+    Fast(regex::Captures<'t>),
+    Fancy(fancy_regex::Captures<'t, str>),
+}
+
+impl<'t> PatternCaptures<'t> {
+    /// Number of capture groups, including group 0.
+    pub fn len(&self) -> usize {
+        match self {
+            PatternCaptures::Fast(c) => c.len(),
+            PatternCaptures::Fancy(c) => c.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The text of capture group `i`, if it participated in the match.
+    pub fn group(&self, i: usize) -> Option<&str> {
+        match self {
+            PatternCaptures::Fast(c) => c.get(i).map(|m| m.as_str()),
+            PatternCaptures::Fancy(c) => c.get(i).map(|m| m.as_str()),
+        }
+    }
 }
 
 /// A compiled JS global/property pattern for matching against HTML/inline-script content
