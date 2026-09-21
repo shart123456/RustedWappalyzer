@@ -1,0 +1,188 @@
+# RustedWappalyzer — standalone deployment into the bbot.io API cluster namespace.
+#
+# Deploy as a SEPARATE release/manifest (like asndb / cloudcheck): this file owns
+# the Deployment + Service + egress NetworkPolicy. The gateway's IngressRoute is
+# added separately in the portal chart's values.yaml (see deploy/k8s/INGRESS.md).
+#
+#   kubectl apply -n <release-namespace> -f deploy/k8s/wappalyzer.yaml
+#
+# The Service name MUST be `wappalyzer` to match the IngressRoute service ref.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wappalyzer
+  labels:
+    app: wappalyzer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wappalyzer
+  template:
+    metadata:
+      labels:
+        app: wappalyzer
+    spec:
+      securityContext:
+        # Matches the `USER app` (uid/gid 10001) in the Dockerfile, which seeds
+        # and chowns /data so the cache module can write there as this user.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: wappalyzer
+          image: "blacklanternsecurity/rusted-wappalyzer:latest"  # build+push; pin a tag
+          imagePullPolicy: IfNotPresent
+          # The image sets CMD ["rustywap", "serve"] and deliberately declares
+          # NO ENTRYPOINT. Kubernetes resolves the two fields independently:
+          # container.command overrides the image ENTRYPOINT and container.args
+          # overrides the image CMD. So an args-only override here would NOT
+          # inherit "rustywap" from anywhere — command would resolve to empty,
+          # kubelet would exec the first arg ("serve") as the program, and the
+          # pod would keep CrashLooping. Both fields must therefore be set.
+          #
+          # The binary is /usr/local/bin/rustywap (Dockerfile COPY + Cargo.toml
+          # [[bin]]). It was called `wappalyzer` until commit 286c408 renamed
+          # it; these manifests were never updated, so every pod died with
+          #   exec: "wappalyzer": executable file not found in $PATH
+          # Naming the absolute path rather than relying on $PATH lookup means a
+          # future base-image or PATH change cannot resurrect that failure, and
+          # a rename shows up as a missing-file error at the exact path recorded
+          # here instead of a confusing $PATH miss.
+          command: ["/usr/local/bin/rustywap"]
+          args: ["serve", "--port", "3000"]
+          ports:
+            - containerPort: 3000
+          env:
+            # Auth is delegated to the gateway forwardAuth. Do NOT set API_KEY:
+            # the client's gateway Bearer key is forwarded to this upstream and
+            # would fail an in-process static-key check.
+            #
+            # Rate limiting is enforced by the gateway (per API key, per host).
+            # Disable the in-process limiter — behind Traefik it sees only the
+            # proxy IP and would throttle all clients into one bucket.
+            - name: RATE_LIMIT_DISABLED
+              value: "true"
+            # Optional CVE/PoC/KEV enrichment DB (separate from the gateway Mongo).
+            # Leave unset to run detection-only; the service degrades gracefully.
+            # - name: MONGODB_URI
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: wappalyzer-enrichment
+            #       key: mongodb-uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            # /data (seeded, owned by uid 10001) must stay writable for cache
+            # refresh; everything else could be made read-only in a later pass.
+            readOnlyRootFilesystem: false
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Memory is sized from a MEASURED idle RSS of the release binary on
+            # a real machine, not from a guess:
+            #   rustywap serve      -> 648 MB  (two full pattern databases are
+            #                                   loaded; a companion fix removes
+            #                                   the duplicate)
+            #   rustywap serve -k   -> 334 MB  (one pattern database)
+            # These pods run secure mode (no -k), so once the companion memory
+            # fix lands their idle footprint sits near the 334 MB figure.
+            #
+            # That 334 MB is the floor a pod pays before it serves a single
+            # request. The previous 256Mi request was therefore BELOW the
+            # process's own baseline: the scheduler packed nodes against a
+            # number the pod could never honour, so every node was oversold.
+            # The previous 512Mi limit left roughly 180 MB above the baseline
+            # for the in-process response cache plus all concurrent analyses,
+            # which is how a burst of /batch traffic becomes an OOMKill instead
+            # of a slow response.
+            #
+            #   requests 512Mi = the 334 MB baseline plus room for the response
+            #                    cache to warm, so the scheduler reserves what
+            #                    the pod actually holds at rest.
+            #   limits   1Gi   = ~3x the measured idle baseline: headroom for
+            #                    the cache and concurrent request buffers, and
+            #                    still above the 648 MB pre-fix footprint, so
+            #                    this sizing is safe both before and after the
+            #                    companion memory fix lands.
+            #
+            # CPU is untouched: it was never implicated in the crashes, and
+            # detection work is bursty (a 1-core ceiling with a 250m floor still
+            # matches the observed shape of the workload).
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wappalyzer
+  labels:
+    app: wappalyzer
+spec:
+  selector:
+    app: wappalyzer
+  ports:
+    - port: 80          # IngressRoute targets port 80
+      targetPort: 3000  # container listens on 3000
+      protocol: TCP
+---
+# Egress lockdown: this service fetches arbitrary user-supplied URLs (SSRF by
+# design). Keep it from reaching cluster-internal services, RFC1918, CGNAT, and
+# the cloud metadata endpoint (169.254.169.254 ⊂ 169.254.0.0/16). Application-
+# layer SSRF checks are a second line of defense, not the only one.
+#
+# REQUIRES a CNI that enforces NetworkPolicy (Calico on this cluster). Verify
+# the cluster pod/service CIDRs are inside the excluded ranges below (AKS
+# defaults are within 10.0.0.0/8); widen the `except` list if not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wappalyzer-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: wappalyzer
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution.
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Outbound web fetches to the public internet only.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16   # link-local incl. cloud metadata
+              - 100.64.0.0/10    # CGNAT
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443

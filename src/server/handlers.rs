@@ -446,7 +446,6 @@ pub async fn batch(
     }
 
     let confidence = body.confidence.unwrap_or(50);
-    let concurrency = body.concurrency.unwrap_or(5);
     let full_scan = body.full_scan.unwrap_or(false);
     let vault_arc = Arc::clone(vault.get_ref());
     let poc_vault_arc = Arc::clone(poc_vault.get_ref());
@@ -458,6 +457,39 @@ pub async fn batch(
             "error": format!("Batch size {} exceeds maximum of {}", body.urls.len(), max_batch)
         }));
     }
+
+    // Validate `concurrency` at the API boundary before it reaches a semaphore.
+    // Unvalidated, this one field was a remote denial of service: `0` produced
+    // `Semaphore::new(0)`, which hands out no permits, so every spawned task
+    // awaited `acquire()` forever and the request never answered; and a huge
+    // value such as 18446744073709551615 exceeded tokio's MAX_PERMITS and
+    // panicked the actix worker thread outright, dropping the connection.
+    //
+    // This is a 400 rather than a silent clamp, deliberately. `concurrency` is a
+    // batch-LEVEL property of the request, like the size limit and auth checks
+    // above, and this handler's established split is that batch-level problems
+    // fail the whole request while only per-URL problems degrade to per-URL
+    // error entries. A silent clamp would also hide the caller's bug: a client
+    // that computed `concurrency: 0` from an empty list, or overflowed its own
+    // arithmetic, gets told so instead of quietly receiving serialized results
+    // and concluding the parameter works.
+    //
+    // The ceiling is the batch size limit because more workers than URLs can
+    // never be used -- there are only ever `urls.len()` tasks -- and that keeps
+    // the accepted range comfortably inside what a semaphore can represent.
+    // `analyze_urls_batch` clamps again for non-HTTP callers; see the comment
+    // there on why the guard is duplicated.
+    if let Some(requested) = body.concurrency {
+        if requested == 0 || requested > max_batch {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!(
+                    "Concurrency {} is out of range; must be between 1 and {}",
+                    requested, max_batch
+                )
+            }));
+        }
+    }
+    let concurrency = body.concurrency.unwrap_or(5);
 
     // Per-URL validation. A URL that fails validation becomes an error entry in
     // the response rather than rejecting the whole batch: one internal host or
