@@ -55,11 +55,54 @@ impl StandaloneWappalyzer {
     pub async fn with_config(insecure: bool, config: WappalyzerConfig) -> Result<Self, WappalyzerError> {
         tracing::info!("Initializing Standalone Wappalyzer");
         let analyzer = Arc::new(TechnologyAnalyzer::new().await?);
-        let http_client = HttpClient::new_with_config(insecure, &config)?;
 
         let (tech_count, cat_count) = analyzer.get_stats();
         tracing::info!(technologies = tech_count, categories = cat_count, "Database loaded");
         crate::analyzer::log_skipped_pattern_summary();
+
+        // Everything past this point is the cheap per-instance wrapper, and it is
+        // shared verbatim with `with_shared_analyzer`. Keeping it in one place is
+        // deliberate: if the two paths ever built their HTTP client or asset cache
+        // differently, the server's per-request `-k` instance would silently stop
+        // honouring the config (timeouts, SSRF protection, cache sizing) that the
+        // primary instance was constructed with, and nothing would fail loudly.
+        Self::with_shared_analyzer(analyzer, insecure, config)
+    }
+
+    /// Build a `StandaloneWappalyzer` around a [`TechnologyAnalyzer`] that has
+    /// already been compiled, instead of compiling the pattern database again.
+    ///
+    /// Compiling the database is by far the expensive part of construction: ~7,500
+    /// technologies with every regex compiled and retained for the process lifetime.
+    /// Measured on a release build, a server that constructed two independent
+    /// instances sat at 648 MB idle RSS versus 334 MB for one.
+    ///
+    /// That gap is what motivated this constructor. At the time, the k8s manifests
+    /// capped the pod at `limits.memory: 512Mi` — below the 648 MB two-database
+    /// footprint — so the two-instance server was OOMKilled before it could answer a
+    /// single request. Those limits have since been raised (to `1Gi`, on the same
+    /// branch as this constructor; see `deploy/k8s/wappalyzer.yaml`), so the OOMKill
+    /// is history. The 314 MB of duplicated regex is not: sharing is what keeps the
+    /// raised ceiling headroom rather than baseline. `TechnologyAnalyzer` is immutable
+    /// once built and is only ever read during analysis, so a single allocation can
+    /// safely back any number of wrappers.
+    ///
+    /// The wrappers still differ where it matters: each gets its OWN `HttpClient`
+    /// (which is what carries `danger_accept_invalid_certs`) and its OWN asset cache.
+    ///
+    /// The separate asset cache is a security requirement, not an oversight. The
+    /// insecure instance fetches linked JS/CSS with certificate validation disabled,
+    /// so anyone able to intercept that connection chooses the body we store. Sharing
+    /// one cache would let that attacker-chosen body be served back to an analysis
+    /// performed by the secure instance — turning an explicit, per-request "I accept
+    /// bad certs" into a silent downgrade for requests that never asked for it. The
+    /// caches must stay per-instance for exactly as long as the TLS behaviour differs.
+    pub fn with_shared_analyzer(
+        analyzer: Arc<TechnologyAnalyzer>,
+        insecure: bool,
+        config: WappalyzerConfig,
+    ) -> Result<Self, WappalyzerError> {
+        let http_client = HttpClient::new_with_config(insecure, &config)?;
 
         let asset_cache = Arc::new(
             moka::sync::Cache::builder()
@@ -74,6 +117,28 @@ impl StandaloneWappalyzer {
             config,
             asset_cache,
         })
+    }
+
+    /// Hand out a counted reference to the compiled pattern database.
+    ///
+    /// This is the supported way for a caller outside the crate to build a second
+    /// wrapper (for example an insecure-mode instance) without paying for a second
+    /// copy of the database; feed the result to [`Self::with_shared_analyzer`].
+    pub fn shared_analyzer(&self) -> Arc<TechnologyAnalyzer> {
+        Arc::clone(&self.analyzer)
+    }
+
+    /// Hand out a counted reference to this instance's linked-asset cache.
+    ///
+    /// Unlike [`Self::shared_analyzer`] this is NOT an invitation to share: it exists
+    /// so that a caller which builds a second wrapper can *prove* the two caches are
+    /// separate allocations (`!Arc::ptr_eq`). The server does exactly that, because
+    /// the isolation is a security property — see the note on
+    /// [`Self::with_shared_analyzer`] about bodies fetched with certificate
+    /// validation disabled. Without an accessor that property is unobservable from
+    /// outside the crate, and an unobservable property is an untestable one.
+    pub fn asset_cache_handle(&self) -> Arc<moka::sync::Cache<String, Arc<String>>> {
+        Arc::clone(&self.asset_cache)
     }
 
     /// Return (technology_count, category_count) from the loaded database
@@ -404,8 +469,25 @@ impl StandaloneWappalyzer {
     /// Reuses the HTTP client (and its TLS session cache / connection pool) that
     /// was configured at construction time.  The `insecure` flag is therefore
     /// controlled by the [`WappalyzerConfig`] passed to [`Self::with_config`].
+    ///
+    /// `concurrency` is clamped to `1..=urls.len()` — see
+    /// [`clamp_batch_concurrency`] for why a raw value is never handed to the
+    /// semaphore.
     pub async fn analyze_urls_batch(&self, urls: Vec<String>, concurrency: usize, min_confidence: u8, full_scan: bool) -> Result<Vec<AnalysisResult>, WappalyzerError> {
         use tokio::sync::Semaphore;
+
+        // Defence in depth. The `/batch` HTTP handler already rejects an
+        // out-of-range `concurrency` with a 400, but that guard only covers the
+        // HTTP surface. This is a public library API: `rustywap batch
+        // --concurrency N` passes the CLI flag straight through, the benchmark
+        // command does the same, and external crates call it directly. Without
+        // this clamp, `0` makes `Semaphore::new(0)` hand out no permits, so
+        // every spawned task parks on `acquire()` forever and the call never
+        // returns; and anything above tokio's MAX_PERMITS (usize::MAX >> 3),
+        // such as `usize::MAX`, panics inside `Semaphore::new` and takes the
+        // calling task -- an actix worker thread, in server mode -- down with
+        // it. Both were reachable from a single JSON field.
+        let concurrency = clamp_batch_concurrency(concurrency, urls.len());
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
         use std::io::IsTerminal;
@@ -551,10 +633,114 @@ impl StandaloneWappalyzer {
 
 }
 
+/// Clamp a caller-supplied batch concurrency into a range a semaphore can hold.
+///
+/// Returned value is always `>= 1` and never exceeds `url_count.max(1)`.
+///
+/// Two separate hazards motivate this, and they sit at opposite ends of the
+/// range:
+///
+/// * `0` is not "no limit", it is "no permits". `Semaphore::new(0)` never
+///   releases anyone, so every task parks on `acquire()` and the batch hangs
+///   until the process dies. There is no timeout on that wait.
+/// * Very large values panic rather than saturate: tokio asserts
+///   `permits <= MAX_PERMITS` (`usize::MAX >> 3`) inside `Semaphore::new`, so a
+///   value like `usize::MAX` aborts the task that constructed it.
+///
+/// The upper bound is `url_count` rather than some fixed ceiling because a
+/// permit that no task can ever take is dead weight: with N URLs there are only
+/// ever N tasks, so anything above N behaves identically to N while widening
+/// the range in which the two hazards above live. `max(1)` keeps an empty batch
+/// from producing `clamp(1, 0)`, which itself panics.
+pub fn clamp_batch_concurrency(requested: usize, url_count: usize) -> usize {
+    requested.clamp(1, url_count.max(1))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for a remote DoS: `/batch` accepted `concurrency`
+    /// verbatim, so `0` hung the request forever and `u64::MAX` panicked the
+    /// actix worker thread inside `Semaphore::new`. Pure and offline.
+    #[test]
+    fn test_clamp_batch_concurrency() {
+        // Zero would mean a semaphore that never hands out a permit.
+        assert_eq!(clamp_batch_concurrency(0, 10), 1);
+        // usize::MAX is past tokio's MAX_PERMITS and used to panic.
+        assert_eq!(clamp_batch_concurrency(usize::MAX, 10), 10);
+        // Sane values pass through untouched.
+        assert_eq!(clamp_batch_concurrency(5, 10), 5);
+        assert_eq!(clamp_batch_concurrency(10, 10), 10);
+        // More concurrency than URLs is capped at the number of tasks.
+        assert_eq!(clamp_batch_concurrency(50, 3), 3);
+        // An empty batch must not produce clamp(1, 0), which panics.
+        assert_eq!(clamp_batch_concurrency(0, 0), 1);
+        assert_eq!(clamp_batch_concurrency(usize::MAX, 0), 1);
+    }
+
+    /// The clamp is reached at its real call site, not merely as a pure function.
+    ///
+    /// `test_clamp_batch_concurrency` above proves the arithmetic, but nothing
+    /// proved that `analyze_urls_batch` calls it before `Semaphore::new`: delete
+    /// that one line and the pure test stays green while every batch caller passing
+    /// `0` hangs forever. The `/batch` HTTP tests do not close that gap either —
+    /// they send only private addresses, which the SSRF pre-flight rejects, so the
+    /// handler short-circuits on an empty accepted list and never constructs a
+    /// semaphore at all.
+    ///
+    /// The `timeout` is the mechanism of this test, not a safety net. Without the
+    /// clamp, `Semaphore::new(0)` hands out no permits, every spawned task parks on
+    /// `acquire()` forever and the join below never resolves — which would wedge the
+    /// whole test binary instead of failing it. The timeout converts that infinite
+    /// hang into a named failure.
+    ///
+    /// Why 30 s rather than a couple of seconds: the batch pipeline runs
+    /// `detect_from_dns` concurrently with the fetch, and that resolver is built with
+    /// a 3 s timeout and 2 attempts, so a host with no reachable resolver takes ~6 s
+    /// to give up. A tighter bound would flake there. Any finite bound catches the
+    /// regression, because the regression never completes at all.
+    ///
+    /// Network reach: the HTTP side stays on this machine. Nothing listens on
+    /// 127.0.0.1 port 1, so the kernel refuses the connection immediately and no
+    /// packet leaves the loopback interface. `WappalyzerConfig::default()` has
+    /// `ssrf_protection: false`, so the library path does not pre-reject a loopback
+    /// target the way the server path would. The DNS layer does still issue lookups
+    /// for the literal names `127.0.0.1.` and `www.127.0.0.1.` — exactly as the
+    /// existing wiremock tests in `tests/integration_test.rs` already do for their
+    /// loopback mock server — but those names resolve to nothing, no target site is
+    /// contacted, and the assertion below holds whether or not a resolver answers.
+    ///
+    /// Each URL therefore comes back as an `AnalysisResult` carrying a connection
+    /// error, which is the expected outcome here; the assertion is on arity, not on
+    /// detections.
+    #[tokio::test]
+    async fn test_analyze_urls_batch_clamps_zero_concurrency_at_the_call_site() {
+        let wappalyzer = StandaloneWappalyzer::new(false).await
+            .expect("StandaloneWappalyzer::new failed — is wappalyzer_cache.json present or network available?");
+
+        let urls = vec![
+            "http://127.0.0.1:1/".to_string(),
+            "http://127.0.0.1:1/".to_string(),
+        ];
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            wappalyzer.analyze_urls_batch(urls.clone(), 0, 50, false),
+        )
+        .await
+        .expect(
+            "analyze_urls_batch never returned: concurrency 0 reached Semaphore::new \
+             unclamped, so no spawned task was ever granted a permit",
+        )
+        .expect("the batch call itself must succeed; per-URL failures are per-entry");
+
+        assert_eq!(
+            results.len(),
+            urls.len(),
+            "one AnalysisResult per input URL, even when every fetch is refused"
+        );
+    }
 
     #[tokio::test]
     async fn test_pattern_compilation() {

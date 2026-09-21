@@ -383,7 +383,10 @@ impl TechnologyAnalyzer {
                                 }
                                 let short = pkg_name.split('/').last().unwrap_or(pkg_name.as_str());
                                 if let Some(tech) = find_tech(short) {
-                                    TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "package.json-dep", 75, Some(ver_str.to_string()));
+                                    // This arm parses /composer.json; labelling the signal
+                                    // "package.json-dep" pointed readers at a file that was
+                                    // never fetched here.
+                                    TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "composer.json-dep", 75, Some(ver_str.to_string()));
                                 }
                             }
                         }
@@ -393,12 +396,32 @@ impl TechnologyAnalyzer {
                     // {"build":{"version":"2.7.14",...},"java":{"version":"17.0.7"}}
                     if let Ok(info) = serde_json::from_str::<serde_json::Value>(body) {
                         if let Some(ver) = info.pointer("/build/version").and_then(|v| v.as_str()) {
-                            // Match any Spring-related tech in the DB
-                            if let Some(tech) = self.database.technologies.keys()
-                                .find(|k| k.to_lowercase().contains("spring"))
-                                .cloned()
-                            {
-                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "package.json", 100, Some(ver.to_string()));
+                            // Resolve the product by exact, case-insensitive name lookup.
+                            //
+                            // This used to be a substring scan for the first database key
+                            // containing "spring". Twelve shipped technologies match that
+                            // substring -- Spring, Spring Metrics, SharpSpring, FastSpring,
+                            // Fastspring, Searchspring, Springbig, BizSpring, FeedSpring,
+                            // Springnest, Spring for creators, SharpSpring Ads -- and
+                            // HashMap iteration order in Rust is unspecified and randomised
+                            // per process. So a real actuator's build version was attributed
+                            // to an arbitrary one of those, and the winner changed between
+                            // runs of the same binary. That is worse than a cosmetic label
+                            // bug: the tech name selects the CPE, so the version flowed into
+                            // CVE lookups against an unrelated product (a marketing suite,
+                            // say) and produced findings that were not just wrong but
+                            // irreproducible.
+                            //
+                            // "Spring Boot" is the accurate product for an /actuator/info
+                            // endpoint, so try it first; the database currently ships only
+                            // the broader "Spring" entry, so fall back to that rather than
+                            // dropping the version on the floor. Both arms are exact
+                            // lookups, so neither can ever select SharpSpring et al.
+                            if let Some(tech) = find_tech("Spring Boot").or_else(|| find_tech("Spring")) {
+                                // Signal value names the real source: this came from the
+                                // actuator probe, not from a package.json (the old value,
+                                // which users read as evidence and could not act on).
+                                TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "spring-actuator", 100, Some(ver.to_string()));
                             }
                         }
                         if let Some(java_ver) = info.pointer("/java/version").and_then(|v| v.as_str()) {
@@ -538,7 +561,35 @@ impl TechnologyAnalyzer {
                     });
 
                     if SPRING_BOOT_ERR_RE.is_match(body) {
-                        if let Some(tech) = find_tech("Spring Boot") {
+                        // Why the two-step lookup (the same chain the
+                        // "spring-actuator" arm above uses):
+                        //
+                        // "Spring Boot" is the accurate product name for this
+                        // fingerprint -- the JSON error envelope is emitted by
+                        // Boot's default /error handler, not by Spring Framework
+                        // on its own -- but the shipped upstream database has no
+                        // "Spring Boot" technology. Of the twelve keys containing
+                        // "spring" (Spring, Spring Metrics, SharpSpring, FastSpring,
+                        // Fastspring, Searchspring, Springbig, BizSpring, FeedSpring,
+                        // Springnest, Spring for creators, SharpSpring Ads) the only
+                        // framework entry is the broader "Spring", and
+                        // data/tech_aliases.json defines no alias onto it either.
+                        //
+                        // find_tech resolves through name_index, which is an exact
+                        // case-insensitive map lookup -- not a substring search. So a
+                        // bare find_tech("Spring Boot") returns None against every
+                        // real database, and this branch was unreachable code that
+                        // could never record a detection. Ask for the precise name
+                        // first, then fall back to the entry that actually exists,
+                        // rather than silently dropping the finding.
+                        //
+                        // REVISIT if upstream ever adds a "Spring Boot" technology:
+                        // the fallback retires itself (the first lookup wins), but the
+                        // CPE behind the name changes with it, so the version/CVE
+                        // story for these arms should be re-checked at that point.
+                        // The three Spring arms further down share this reasoning and
+                        // point back here instead of repeating it.
+                        if let Some(tech) = find_tech("Spring Boot").or_else(|| find_tech("Spring")) {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "endpoint", 75, None);
                         }
                     }
@@ -631,7 +682,9 @@ impl TechnologyAnalyzer {
                     // Spring Boot Actuator health, or generic {"status":"UP"/"ok"/"healthy"}
                     if body.contains("\"status\"") {
                         if body.contains("\"UP\"") || body.contains("\"up\"") {
-                            if let Some(tech) = find_tech("Spring Boot") {
+                            // Spring Boot -> Spring fallback; see the error-page
+                            // arm above for why the second lookup is required.
+                            if let Some(tech) = find_tech("Spring Boot").or_else(|| find_tech("Spring")) {
                                 TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "actuator-health", 60, None);
                             }
                         }
@@ -785,7 +838,9 @@ impl TechnologyAnalyzer {
                 }
                 "spring-health" => {
                     if body.contains("\"status\"") && (body.contains("\"UP\"") || body.contains("\"DOWN\"")) {
-                        if let Some(tech) = find_tech("Spring Boot") {
+                        // Spring Boot -> Spring fallback; see the error-page arm
+                        // above for why the second lookup is required.
+                        if let Some(tech) = find_tech("Spring Boot").or_else(|| find_tech("Spring")) {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "actuator-health", 85, None);
                         }
                     }
@@ -793,7 +848,9 @@ impl TechnologyAnalyzer {
                 "spring-actuator-env" => {
                     // /actuator/env exposes active profiles and property sources
                     if body.contains("\"activeProfiles\"") || body.contains("\"propertySources\"") {
-                        if let Some(tech) = find_tech("Spring Boot") {
+                        // Spring Boot -> Spring fallback; see the error-page arm
+                        // above for why the second lookup is required.
+                        if let Some(tech) = find_tech("Spring Boot").or_else(|| find_tech("Spring")) {
                             TechnologyAnalyzer::update_detection(new_detected, &tech, "probe", "actuator-env", 90, None);
                         }
                         if let Some(tech) = find_tech("Java") {
@@ -1374,5 +1431,211 @@ mod django_probe_tests {
         assert!(accepts_status_for_tag("django-static", 200));
         assert!(!accepts_status_for_tag("django-static", 403));
         assert!(!accepts_status_for_tag("django-static", 404));
+    }
+}
+
+#[cfg(test)]
+mod probe_parse_tests {
+    use super::*;
+    use crate::types::{TechnologyDefinition, WappalyzerDatabase};
+
+    /// Every name in the shipped database that contains the substring "spring".
+    /// This is the exact list the old `keys().find(|k| k.contains("spring"))`
+    /// scan drew from, which is why the test hard-codes it: it is the hazard
+    /// being guarded, so it must not drift silently with the database.
+    const SPRING_SUBSTRING_NAMES: &[&str] = &[
+        "Spring", "Spring Metrics", "SharpSpring", "FastSpring", "Fastspring",
+        "Searchspring", "Springbig", "BizSpring", "FeedSpring", "Springnest",
+        "Spring for creators", "SharpSpring Ads",
+    ];
+
+    /// An analyzer holding just enough database to exercise name resolution in
+    /// `parse_probe_responses`. `TechnologyDefinition` has `#[serde(default)]`
+    /// on every field, so an empty JSON object is the cheapest valid instance;
+    /// nothing in these arms reads the definition, only the key it is filed
+    /// under. `name_index` is built exactly as `TechnologyAnalyzer::new` builds
+    /// it, so the lookup under test behaves as it does in production.
+    fn analyzer_with_techs(names: &[&str]) -> TechnologyAnalyzer {
+        let technologies: HashMap<String, TechnologyDefinition> = names.iter()
+            .map(|n| (n.to_string(), serde_json::from_str("{}").unwrap()))
+            .collect();
+        let name_index: HashMap<String, String> = technologies.keys()
+            .map(|k| (k.to_lowercase(), k.clone()))
+            .collect();
+        TechnologyAnalyzer {
+            database: WappalyzerDatabase { technologies, categories: HashMap::new() },
+            html_patterns: HashMap::new(),
+            header_patterns: HashMap::new(),
+            url_patterns: HashMap::new(),
+            script_patterns: HashMap::new(),
+            inline_script_patterns: HashMap::new(),
+            meta_patterns: HashMap::new(),
+            css_patterns: HashMap::new(),
+            cookie_patterns: HashMap::new(),
+            name_index,
+            category_name_map: HashMap::new(),
+            favicon_hashes: HashMap::new(),
+            dns_patterns: HashMap::new(),
+            js_patterns: HashMap::new(),
+            cpe_overrides: HashMap::new(),
+            tech_aliases: HashMap::new(),
+            version_patches: HashMap::new(),
+            implies_graph: HashMap::new(),
+            dom_rules: HashMap::new(),
+        }
+    }
+
+    fn parse(analyzer: &TechnologyAnalyzer, tag: &'static str, body: &str)
+        -> HashMap<String, TechDetection>
+    {
+        let responses = vec![(tag, "https://example.com/probe".to_string(), body.to_string(), 200u16)];
+        let mut detected = HashMap::new();
+        analyzer.parse_probe_responses(&responses, &mut detected);
+        detected
+    }
+
+    /// Regression: the actuator arm picked its technology with a substring scan
+    /// over `database.technologies.keys()`, and HashMap iteration order is
+    /// unspecified and randomised per process. With the twelve shipped
+    /// "…spring…" names present, that scan could return any of them, so this
+    /// runs the real arm many times over the real key set. Under the old code
+    /// the assertion fails as soon as iteration order puts, say, SharpSpring
+    /// first; under the exact lookup the answer is the same every time.
+    #[test]
+    fn spring_actuator_build_version_is_attributed_to_spring_every_time() {
+        let body = r#"{"build":{"version":"2.7.14"},"java":{"version":"17.0.7"}}"#;
+
+        // A fresh analyzer per iteration on purpose: std's RandomState fixes a
+        // hasher per HashMap instance, so one map iterates in one order for its
+        // whole life. Rebuilding is what actually resamples the order the old
+        // substring scan depended on.
+        for _ in 0..64 {
+            let analyzer = analyzer_with_techs(SPRING_SUBSTRING_NAMES);
+            let detected = parse(&analyzer, "spring-actuator", body);
+            let hits: Vec<&str> = detected.keys().map(|k| k.as_str()).collect();
+            assert_eq!(
+                hits, vec!["Spring"],
+                "actuator build version must land on Spring alone, got {hits:?}"
+            );
+            assert_eq!(detected["Spring"].version.as_deref(), Some("2.7.14"));
+        }
+    }
+
+    /// The canonical, most specific name wins when the database carries it.
+    /// A substring scan could not express this preference at all.
+    #[test]
+    fn spring_actuator_prefers_spring_boot_when_the_database_has_it() {
+        let mut names = SPRING_SUBSTRING_NAMES.to_vec();
+        names.push("Spring Boot");
+        let analyzer = analyzer_with_techs(&names);
+
+        let detected = parse(&analyzer, "spring-actuator", r#"{"build":{"version":"3.2.1"}}"#);
+        let hits: Vec<&str> = detected.keys().map(|k| k.as_str()).collect();
+        assert_eq!(hits, vec!["Spring Boot"]);
+        assert_eq!(detected["Spring Boot"].version.as_deref(), Some("3.2.1"));
+    }
+
+    /// Signal values are shown to users as the evidence for a detection, so a
+    /// version read from /actuator/info must not claim it came from a
+    /// package.json that was never fetched.
+    #[test]
+    fn spring_actuator_signal_names_the_actuator_not_package_json() {
+        let analyzer = analyzer_with_techs(SPRING_SUBSTRING_NAMES);
+        let detected = parse(&analyzer, "spring-actuator", r#"{"build":{"version":"2.7.14"}}"#);
+        let values: Vec<&str> = detected["Spring"].signals.iter()
+            .map(|s| s.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["spring-actuator"]);
+    }
+
+    /// Same evidence rule for the composer.json arm, which used to label its
+    /// findings "package.json-dep".
+    #[test]
+    fn composer_json_signal_names_composer_json() {
+        let analyzer = analyzer_with_techs(&["Laravel"]);
+        let detected = parse(&analyzer, "composer-json", r#"{"require":{"laravel/laravel":"10.3.3"}}"#);
+        let values: Vec<&str> = detected["Laravel"].signals.iter()
+            .map(|s| s.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["composer.json-dep"]);
+        assert_eq!(detected["Laravel"].version.as_deref(), Some("10.3.3"));
+    }
+
+    /// Every (tag, body) pair that a Spring probe arm is supposed to fire on.
+    /// Each body is the minimum that satisfies that arm's own guard, copied
+    /// from the matcher in the arm, so this table exercises the real code path
+    /// rather than restating it.
+    const SPRING_ARM_CASES: &[(&str, &str)] = &[
+        // Spring Boot's default /error envelope, served for an unmapped path.
+        ("error-page", r#"{"timestamp":"2026-01-01T00:00:00.000+00:00","status":404,"error":"Not Found","path":"/nope"}"#),
+        // Generic health JSON from /health, /healthz and friends.
+        ("health-json", r#"{"status":"UP"}"#),
+        // Actuator health: /actuator/health.
+        ("spring-health", r#"{"status":"UP","components":{"db":{"status":"UP"}}}"#),
+        // Actuator env: /actuator/env.
+        ("spring-actuator-env", r#"{"activeProfiles":["prod"],"propertySources":[]}"#),
+    ];
+
+    /// Regression: four arms -- "error-page", "health-json", "spring-health"
+    /// and "spring-actuator-env" -- resolved their technology with a bare
+    /// `find_tech("Spring Boot")`. `find_tech` goes through `find_tech_name`,
+    /// which is an exact case-insensitive lookup in `name_index`, and the
+    /// shipped database has no "Spring Boot" key (only the broader "Spring";
+    /// see SPRING_SUBSTRING_NAMES). Every one of those lookups therefore
+    /// returned None: the arms were unreachable code, and a genuine Spring
+    /// site produced no detection from any of them.
+    ///
+    /// What this guards: not "the fallback is spelled a certain way", but
+    /// "the name chain each arm uses resolves to something against the
+    /// database we actually ship". The fixture mirrors that database -- all
+    /// twelve "...spring..." names, none of them "Spring Boot" -- and the real
+    /// `parse_probe_responses` is driven end to end. Revert any arm to
+    /// `find_tech("Spring Boot")` and its case here resolves to nothing,
+    /// `detected` comes back empty, and the assertion fails on that tag.
+    ///
+    /// Asserting exactly `["Spring"]` rather than merely "non-empty" also
+    /// keeps the older substring-scan hazard buried: SharpSpring, FastSpring
+    /// and the rest are all present in the fixture, so a lookup that went back
+    /// to scanning keys for "spring" would land on an arbitrary one of them
+    /// and fail here too.
+    #[test]
+    fn every_spring_probe_arm_resolves_against_the_shipped_database() {
+        let analyzer = analyzer_with_techs(SPRING_SUBSTRING_NAMES);
+
+        for (tag, body) in SPRING_ARM_CASES {
+            let tag = *tag;
+            let detected = parse(&analyzer, tag, body);
+            let hits: Vec<&str> = detected.keys().map(|k| k.as_str()).collect();
+            assert_eq!(
+                hits,
+                vec!["Spring"],
+                "the {tag} arm must record a detection on Spring, got {hits:?}"
+            );
+        }
+    }
+
+    /// The fallback is a fallback, not a substitute. When a database does
+    /// carry "Spring Boot", each arm must file its detection under that more
+    /// precise name -- the name selects the CPE, and Spring Boot's CVEs are
+    /// not Spring Framework's. This is what makes the REVISIT note on the
+    /// error-page arm actionable: the day upstream adds the entry, these arms
+    /// switch over with no code change, and that is asserted here rather than
+    /// assumed.
+    #[test]
+    fn every_spring_probe_arm_prefers_spring_boot_when_the_database_has_it() {
+        let mut names = SPRING_SUBSTRING_NAMES.to_vec();
+        names.push("Spring Boot");
+        let analyzer = analyzer_with_techs(&names);
+
+        for (tag, body) in SPRING_ARM_CASES {
+            let tag = *tag;
+            let detected = parse(&analyzer, tag, body);
+            let hits: Vec<&str> = detected.keys().map(|k| k.as_str()).collect();
+            assert_eq!(
+                hits,
+                vec!["Spring Boot"],
+                "the {tag} arm must prefer Spring Boot when it exists, got {hits:?}"
+            );
+        }
     }
 }

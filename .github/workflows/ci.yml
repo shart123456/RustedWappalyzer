@@ -54,6 +54,27 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets
 
+      # The `python` feature is advertised in Cargo.toml and in the crate-level docs but
+      # was built by nothing, so it rotted: a field added to `HttpResponse` was never
+      # mirrored in src/python.rs and `cargo build --features python` failed for months
+      # while CI stayed green. This step is the fix for that class of rot.
+      #
+      # A step in this job rather than a job of its own: it wants the same apt packages,
+      # the same toolchain and -- most importantly -- the same target/ directory, which
+      # this job already caches. A separate job would install and cache all of it twice,
+      # and the two caches would fight over the same key prefix, for a build that only
+      # adds pyo3 on top of a tree this job has already compiled.
+      #
+      # `build --lib`, deliberately, not `test` and not `--all-targets`: pyo3 is pulled in
+      # with the "extension-module" feature, which tells it NOT to link against libpython
+      # (the interpreter supplies those symbols at import time). A shared library may
+      # carry undefined symbols, so the cdylib links fine; an executable -- the test
+      # harness, or the `rustywap` binary -- may not, and would fail at link time for
+      # reasons that have nothing to do with the code being wrong. Compiling the library
+      # is what catches the drift this step exists to catch.
+      - name: Build python feature
+        run: cargo build --locked --lib --features python
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

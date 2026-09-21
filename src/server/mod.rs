@@ -37,30 +37,13 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     let server_config = WappalyzerConfig { ssrf_protection: true, ..WappalyzerConfig::default() };
     let wappalyzer = Arc::new(StandaloneWappalyzer::with_config(insecure, server_config).await?);
     wappalyzer.warm_up().await;
+
+    let insecure_wappalyzer = build_insecure_instance(&wappalyzer, insecure);
+    let insecure_data = actix_web::web::Data::new(insecure_wappalyzer);
+
     let wappalyzer_for_refresh = Arc::clone(&wappalyzer);
     let data = actix_web::web::Data::new(wappalyzer);
     let insecure_flag = actix_web::web::Data::new(insecure);
-
-    // Pre-build an insecure wappalyzer instance so that per-request `-k` overrides
-    // do not pay the full pattern-compilation cost.  Only needed when the server
-    // itself starts in secure mode.
-    let insecure_wappalyzer: Arc<Option<StandaloneWappalyzer>> = if !insecure {
-        let insecure_config = WappalyzerConfig { ssrf_protection: true, ..WappalyzerConfig::default() };
-        match StandaloneWappalyzer::with_config(true, insecure_config).await {
-            Ok(w) => {
-                tracing::info!("Pre-built insecure wappalyzer instance ready");
-                Arc::new(Some(w))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Could not pre-build insecure wappalyzer; per-request insecure mode unavailable");
-                Arc::new(None)
-            }
-        }
-    } else {
-        // Server already runs insecure — no second instance needed.
-        Arc::new(None)
-    };
-    let insecure_data = actix_web::web::Data::new(insecure_wappalyzer);
 
     // Rate limiter: 600 requests per minute per IP by default (10 req/s sustained).
     // Sized for batch consumers; the analyzer's actual CPU work (regex + headers/body
@@ -123,6 +106,67 @@ pub async fn run(port: u16, insecure: bool) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Pre-build the insecure wappalyzer instance that serves per-request `-k`
+/// overrides, so those requests do not pay the full pattern-compilation cost.
+///
+/// Returns `None` when the server itself already runs insecure: the primary
+/// instance already accepts bad certificates, so a second wrapper would be pure
+/// overhead. `None` is also the failure mode — a wrapper that cannot be built
+/// disables per-request insecure mode rather than preventing the server starting.
+///
+/// This instance REUSES the compiled pattern database via `shared_analyzer()`
+/// instead of constructing a second one with `with_config`. It used to call
+/// `with_config`, which re-reads the database and recompiles every regex for all
+/// ~7,500 technologies: measured on a release build that was 648 MB idle RSS
+/// versus 334 MB with a single copy.
+///
+/// That mattered because the k8s manifests at the time capped the pod at
+/// `limits.memory: 512Mi`, below the 648 MB two-database footprint, so the default
+/// (secure) mode was OOMKilled before it served a request. Those limits were raised
+/// on this same branch (`deploy/k8s/wappalyzer.yaml` now requests 512Mi and limits
+/// 1Gi), so the OOMKill itself is fixed twice over — but the 314 MB of duplicated
+/// regex is not something the raised ceiling should be spent on.
+/// `TechnologyAnalyzer` is immutable after construction, so one allocation can
+/// safely back both wrappers.
+///
+/// What is NOT shared: the HTTP client (that is where
+/// `danger_accept_invalid_certs` lives, and it is the entire point of this second
+/// instance) and the asset cache (a body this instance fetched without validating
+/// the certificate must never be served back to the secure instance's analysis).
+/// `with_shared_analyzer` gives each wrapper its own of both.
+///
+/// This lives in its own function rather than inline in [`run`] so that it can be
+/// tested. Both properties above — one compiled database, two asset caches — are
+/// properties of THIS call site choosing `with_shared_analyzer`, not of
+/// `with_shared_analyzer` itself: that constructor takes the analyzer by value and
+/// is synchronous, so it could not build its own even in principle
+/// (`TechnologyAnalyzer::new` is async). Asserting against it directly would only
+/// restate Rust's semantics; asserting against this function catches the revert.
+fn build_insecure_instance(
+    primary: &StandaloneWappalyzer,
+    server_insecure: bool,
+) -> Arc<Option<StandaloneWappalyzer>> {
+    if server_insecure {
+        return Arc::new(None);
+    }
+
+    let insecure_config = WappalyzerConfig { ssrf_protection: true, ..WappalyzerConfig::default() };
+    match StandaloneWappalyzer::with_shared_analyzer(
+        primary.shared_analyzer(),
+        true,
+        insecure_config,
+    ) {
+        Ok(w) => {
+            tracing::info!("Pre-built insecure wappalyzer instance ready (pattern database shared)");
+            Arc::new(Some(w))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not pre-build insecure wappalyzer; per-request insecure mode unavailable");
+            Arc::new(None)
+        }
+    }
 }
 
 /// Everything the HTTP layer needs, built once and shared by every worker.
@@ -589,6 +633,146 @@ mod http_tests {
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = test::read_body_json(resp).await;
         assert!(body["error"].as_str().unwrap().contains("exceeds maximum"));
+    }
+
+    #[actix_web::test]
+    async fn batch_rejects_zero_concurrency_instead_of_hanging() {
+        // Covers the handler's `concurrency` range check: 0 is rejected with a 400
+        // before `analyze_urls_batch` — and therefore `Semaphore::new` — is ever
+        // reached.
+        //
+        // It does not reproduce the original hang, and could not: the single URL is
+        // a private address, so the SSRF pre-flight rejects it, `accepted_urls` ends
+        // up empty and the handler takes its empty-accepted short-circuit. No
+        // semaphore is constructed on this path even with the range check deleted,
+        // which is also why the request here is safely offline.
+        //
+        // The hang being guarded against was real — `Semaphore::new(0)` hands out no
+        // permits, so every spawned task awaits `acquire()` forever and a single
+        // unauthenticated POST pins a worker indefinitely — but it is reproduced at
+        // the library call site, by
+        // `test_analyze_urls_batch_clamps_zero_concurrency_at_the_call_site` in
+        // src/lib.rs. What this test proves is that the handler answers first.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(r#"{"urls":["http://10.0.0.1/"],"concurrency":0}"#)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            400,
+            "concurrency is a batch-level property, so a bad value fails the request"
+        );
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("Concurrency"),
+            "expected a concurrency range error, got {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn batch_rejects_absurd_concurrency_without_panicking_the_worker() {
+        // Covers the other end of the same range check: u64::MAX is far above the
+        // configured batch maximum, so it is rejected with a 400.
+        //
+        // As with the zero case, this does not reproduce the original panic. The URL
+        // is a private address the SSRF pre-flight rejects, so the handler
+        // short-circuits on an empty accepted list and never builds a semaphore. The
+        // panic was real — u64::MAX permits exceeds tokio's MAX_PERMITS and
+        // `Semaphore::new` asserts rather than saturating, which unwound the actix
+        // worker thread and dropped the connection mid-response (curl saw HTTP 000)
+        // — but what is verified here is only that the handler answers 400 before
+        // any of that is reachable. The saturating clamp behind it is covered by
+        // `test_clamp_batch_concurrency` in src/lib.rs.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(
+                    r#"{"urls":["http://10.0.0.1/"],"concurrency":18446744073709551615}"#,
+                )
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("out of range"),
+            "expected a concurrency range error, got {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn batch_accepts_an_in_range_concurrency() {
+        // The guard must not reject legitimate callers: anything in 1..=100 (the
+        // configured max_batch_size) still reaches the per-URL pipeline, where
+        // the SSRF pre-flight turns this target into a per-URL error entry.
+        let app = test::init_service(App::new().configure(configure_app(default_state().await))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/batch")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(r#"{"urls":["http://10.0.0.1/"],"concurrency":4}"#)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let entries = body.as_array().expect("expected an array of results");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["error"].as_str().unwrap().contains("private/internal"));
+    }
+
+    #[actix_web::test]
+    async fn insecure_override_instance_shares_the_database_but_not_the_asset_cache() {
+        // Guards the production call site, [`build_insecure_instance`], rather than
+        // the constructor it calls. Reverting it to
+        // `StandaloneWappalyzer::with_config(true, ..).await` — which is what the
+        // server used to do — makes the first assertion fail; it also makes the
+        // function async, so this stops compiling. Either way the revert is caught,
+        // which is exactly what asserting on `with_shared_analyzer` directly could
+        // never do.
+        //
+        // Reuses the shared ANALYZER, so this costs no extra database compile.
+        let primary = analyzer().await;
+        let built = build_insecure_instance(&primary, false);
+        let insecure = match &*built {
+            Some(w) => w,
+            None => panic!("a secure server must pre-build an insecure override instance"),
+        };
+
+        assert!(
+            Arc::ptr_eq(&primary.shared_analyzer(), &insecure.shared_analyzer()),
+            "the insecure override must reuse the primary's compiled pattern database; \
+             compiling a second one costs ~314 MB of resident memory (648 MB total \
+             versus 334 MB) for an identical, immutable copy"
+        );
+        assert!(
+            !Arc::ptr_eq(&primary.asset_cache_handle(), &insecure.asset_cache_handle()),
+            "the asset caches must be DISTINCT allocations: this instance fetches \
+             linked assets with certificate validation disabled, so sharing one cache \
+             would serve an attacker-chosen body back to the secure instance's \
+             analysis — a silent TLS downgrade for requests that never asked for one"
+        );
+    }
+
+    #[actix_web::test]
+    async fn no_insecure_override_instance_when_the_server_already_runs_insecure() {
+        // The primary instance already accepts bad certificates in this mode, so a
+        // second wrapper would add an HTTP client and an asset cache for nothing.
+        let primary = analyzer().await;
+        assert!(
+            build_insecure_instance(&primary, true).is_none(),
+            "an already-insecure server must not pre-build a redundant second instance"
+        );
     }
 
     #[actix_web::test]
