@@ -1,0 +1,38 @@
+{
+  "name": "sonarqube-10.3",
+  "image": "sonarqube:10.3-community",
+  "captured_at": "2026-09-21T23:41:19Z",
+  "captured_by": "fixtures/capture_corpus.sh",
+  "capture_url": "http://127.0.0.1:38511/",
+  "effective_url": "http://127.0.0.1:38511/",
+  "notes": "SonarQube boots an embedded Elasticsearch before it listens, so it is the slowest fixture in the corpus by a wide margin. The tag pins the MINOR version only (10.3), so the recorded ground-truth version is '10.3'.",
+  "body_truncated": false,
+  "body_original_bytes": 1780,
+  "expect": [
+    {
+      "technology": "SonarQube",
+      "version": "10.3",
+      "source": "image tag sonarqube:10.3-community"
+    }
+  ],
+  "response": {
+    "url": "http://127.0.0.1:38511/",
+    "headers": {
+      "x-frame-options": "SAMEORIGIN",
+      "x-xss-protection": "1; mode=block",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; connect-src 'self' http: https:; img-src * data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'none'",
+      "x-content-security-policy": "default-src 'self'; base-uri 'none'; connect-src 'self' http: https:; img-src * data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'none'",
+      "x-webkit-csp": "default-src 'self'; base-uri 'none'; connect-src 'self' http: https:; img-src * data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'none'",
+      "cache-control": "no-cache, no-store, must-revalidate",
+      "vary": "accept-encoding",
+      "content-type": "text/html;charset=utf-8",
+      "content-length": "1780",
+      "date": "Mon, 21 Sep 2026 23:41:18 GMT"
+    },
+    "body": "\n<!DOCTYPE html>\n<html lang=\"en\">\n\n<head>\n    <meta http-equiv=\"content-type\" content=\"text/html; charset=UTF-8\" charset=\"UTF-8\" />\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\n    <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"57x57\" href=\"/apple-touch-icon-57x57.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"60x60\" href=\"/apple-touch-icon-60x60.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"72x72\" href=\"/apple-touch-icon-72x72.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"76x76\" href=\"/apple-touch-icon-76x76.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"114x114\" href=\"/apple-touch-icon-114x114.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"120x120\" href=\"/apple-touch-icon-120x120.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"144x144\" href=\"/apple-touch-icon-144x144.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"152x152\" href=\"/apple-touch-icon-152x152.png\">\n    <link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/apple-touch-icon-180x180.png\">\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\">\n    <meta name=\"application-name\" content=\"SonarQube\" />\n    <meta name=\"msapplication-TileColor\" content=\"#FFFFFF\" />\n    <meta name=\"msapplication-TileImage\" content=\"/mstile-512x512.png\" />\n    <title>SonarQube</title>\n\n    <link rel=\"stylesheet\" href=\"/js/outLF7I6YGY.css\" />\n</head>\n\n<body>\n    <div id=\"content\" data-base-url=\"\" data-server-status=\"STARTING\" data-instance=\"SonarQube\" data-official=\"true\">\n        <div class=\"global-loading\">\n            <i class=\"spinner global-loading-spinner\"></i> \n            <span aria-live=\"polite\" class=\"global-loading-text\">Loading...</span>\n        </div>\n    </div>\n\n    <script type=\"module\" src=\"/js/out6M7OCNJE.js\"></script>\n</body>\n\n</html>\n",
+    "status_code": 200,
+    "response_time_ms": 3,
+    "set_cookie_headers": []
+  }
+}

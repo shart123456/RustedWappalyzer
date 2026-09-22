@@ -63,6 +63,24 @@ pub fn lookaround_pattern_stats() -> (usize, u32) {
     (guard.len(), guard.values().sum())
 }
 
+/// Ceiling on the weight of a single `implies` edge, applied in
+/// [`TechnologyAnalyzer::expand_implied`].
+///
+/// The technology database expresses an implication as `"PHP"` or
+/// `"PHP\;confidence:50"`, and the overwhelming majority carry no explicit
+/// confidence at all. `build_implies_graph` defaults those to 100, so before this
+/// ceiling existed every unqualified implication asserted *certainty* — WordPress
+/// observed at 55 produced PHP at a flat 100, an inference more confident than the
+/// observation it was derived from, and higher than most things we actually saw.
+///
+/// A database author writing a bare `"implies": ["PHP"]` means "these normally go
+/// together", not "this is proof". 90 encodes that: an inference is never quite as
+/// good as an observation, and because the ceiling multiplies in at every hop, a
+/// chain of implications now loses at least 10% per step instead of holding flat.
+/// An edge that DOES carry an explicit `confidence:` below 90 is honoured as
+/// written — the ceiling only removes the unearned default.
+const IMPLIED_EDGE_CEILING: u8 = 90;
+
 /// Returns `(unique_patterns, total_occurrences)` for patterns skipped so far.
 pub fn skipped_pattern_stats() -> (usize, u32) {
     let guard = match SKIPPED_PATTERNS.lock() {
@@ -96,6 +114,19 @@ pub fn log_skipped_pattern_summary() {
             total_occurrences = fallback_total,
             "Patterns using look-around were compiled with the backtracking engine"
         );
+    }
+
+    // Patterns we declined to use, as opposed to ones no engine could compile. Reported
+    // here so the `text` layer's rejections are visible in the same place as the rest.
+    let rejected_text = layers::text::rejected_text_patterns();
+    if !rejected_text.is_empty() {
+        tracing::info!(
+            patterns = rejected_text.len(),
+            "Ignored database `text` patterns anchored to the start of the page text"
+        );
+        for pattern in rejected_text {
+            tracing::debug!(pattern = %pattern, "Ignored `text` pattern");
+        }
     }
 
     let (unique, total) = skipped_pattern_stats();
@@ -143,6 +174,9 @@ pub struct TechnologyAnalyzer {
     /// Pre-parsed implies graph: tech name → list of implied techs with weight/version.
     /// Built once at startup; used in `analyze()` to avoid repeated string parsing.
     pub(crate) implies_graph: HashMap<String, Vec<ImpliedTech>>,
+    /// Compiled patterns from the `text` field: tech name → patterns matched against
+    /// the *visible text* of the page (not the markup). See `layers::text`.
+    pub(crate) text_patterns: HashMap<String, Vec<CompiledPattern>>,
     /// Compiled DOM rules from the `dom` field: tech name → list of rules.
     /// Each rule carries the selector plus its attribute/text conditions, so a
     /// detection only fires when the conditions actually hold (not on selector
@@ -183,6 +217,7 @@ impl TechnologyAnalyzer {
             tech_aliases,
             version_patches,
             implies_graph: HashMap::new(),
+            text_patterns: HashMap::new(),
             dom_rules: HashMap::new(),
         };
 
@@ -430,6 +465,16 @@ impl TechnologyAnalyzer {
                 }
             }
 
+            // Compile visible-page-text patterns (`text` field). Kept in its own map
+            // rather than folded into `html_patterns` because the subject is different:
+            // these match rendered text, so the layer has to strip markup first.
+            if let Some(text_value) = &tech_def.text {
+                let patterns = Self::compile_text_patterns(text_value);
+                if !patterns.is_empty() {
+                    self.text_patterns.insert(tech_name.clone(), patterns);
+                }
+            }
+
             // Compile JS object/property patterns
             if let Some(js_map) = &tech_def.js {
                 let mut compiled_js: Vec<CompiledJsPattern> = Vec::new();
@@ -601,16 +646,18 @@ impl TechnologyAnalyzer {
 
     /// Field-type-aware wrapper around `compile_single_pattern`.
     ///
-    /// For content fields (`html`, `script`, `script_src`, `scripts`, `css`, `url`) an empty
-    /// pattern means "no match pattern defined" — return `Ok(None)` so the tech is not added
-    /// to the compiled map at all, preventing spurious catch-all detections.
+    /// For content fields (`html`, `script`, `script_src`, `scripts`, `css`, `url`, `text`) an
+    /// empty pattern means "no match pattern defined" — return `Ok(None)` so the tech is not
+    /// added to the compiled map at all, preventing spurious catch-all detections. (`text` has
+    /// no such entry in the shipped database, but a `.*` there would tag *every* analysed page
+    /// with the technology, so it is classed with the content fields rather than trusted.)
     ///
     /// For presence-only fields (`header`, `cookie`, `meta`) an empty pattern means "match if
     /// the field exists", so we fall through to `compile_single_pattern` which returns `.*`.
     fn compile_single_pattern_typed(pattern: &str, field_type: &str) -> Result<Option<CompiledPattern>, WappalyzerError> {
         if pattern.is_empty() {
             match field_type {
-                "html" | "script" | "script_src" | "scripts" | "css" | "url" => {
+                "html" | "script" | "script_src" | "scripts" | "css" | "url" | "text" => {
                     return Ok(None);
                 }
                 _ => {} // header, cookie, meta — fall through to presence-only `.*`
@@ -742,26 +789,15 @@ impl TechnologyAnalyzer {
         // DOM selector matching: CSS selectors from the Wappalyzer `dom` field
         self.analyze_dom(&response.body, &mut detected_technologies);
 
-        // Apply "implies" logic using pre-computed graph (avoids repeated string parsing)
-        let mut queue: std::collections::VecDeque<String> =
-            detected_technologies.keys().cloned().collect();
-        while let Some(tech_name) = queue.pop_front() {
-            if let Some(implied_list) = self.implies_graph.get(&tech_name) {
-                for implied in implied_list {
-                    if !detected_technologies.contains_key(&implied.name) {
-                        Self::update_detection(
-                            &mut detected_technologies,
-                            &implied.name,
-                            "implied",
-                            &tech_name,
-                            implied.weight,
-                            implied.version.clone(),
-                        );
-                        queue.push_back(implied.name.clone());
-                    }
-                }
-            }
-        }
+        // Visible page text: the Wappalyzer `text` field, matched against rendered text
+        // only (script/style/noscript/template content excluded). Takes the whole response
+        // because it also needs Content-Type. Deliberately weak evidence — see
+        // `layers::text::TEXT_SIGNAL_WEIGHT`.
+        self.analyze_text(response, &mut detected_technologies);
+
+        // Apply "implies" logic using the pre-computed graph, discounting each implied
+        // technology by the confidence of the technology that implied it.
+        self.expand_implied(&mut detected_technologies);
 
         // Apply exclusions and requirements post-processing
         Self::apply_exclusions_and_requirements(&mut detected_technologies, &self.database);
@@ -794,6 +830,124 @@ impl TechnologyAnalyzer {
                 })
             })
             .collect()
+    }
+
+    /// Expand the `implies` graph over an in-progress detection map, discounting every
+    /// implied technology by the confidence of the technology that implied it.
+    ///
+    /// # Why the confidence has to be computed here
+    ///
+    /// The implied signal's weight has to be a function of the parent's confidence,
+    /// and the parent's confidence is a function of all its signals — so the expansion
+    /// cannot run before confidence exists, which is exactly where it used to sit.
+    /// `analyze()` computed nothing until the final `filter_map`, so expansion passed
+    /// `implied.weight` straight through with no reference to the parent at all.
+    ///
+    /// So this computes confidence up front, for the seeds, and then keeps it up to
+    /// date as the frontier advances. That is only safe because of two properties of
+    /// the rest of the pipeline, and it breaks if either changes:
+    ///
+    /// 1. It is computed the same way the final `filter_map` computes it —
+    ///    `dedupe_signals` then [`compute_noisy_or`] — so a technology is never scored
+    ///    two different ways. `dedupe_signals` is idempotent, so deduping here and
+    ///    again later is a no-op the second time. `compute_noisy_or` is CALLED, never
+    ///    re-derived inline, so that the correlated-signal grouping inside it applies
+    ///    identically to both.
+    /// 2. Nothing adds signals to an already-detected technology after this point.
+    ///    The `contains_key` guard below means expansion never touches one, and
+    ///    `apply_exclusions_and_requirements` only ever removes entries.
+    ///
+    /// # Why an implied technology gets exactly one signal
+    ///
+    /// The `contains_key` guard is load-bearing and is preserved verbatim: a
+    /// technology that is already in the map — whether directly observed or implied a
+    /// moment ago by someone else — is skipped entirely. So a directly detected
+    /// technology never receives an implied signal (its own evidence stands), and an
+    /// implied one receives exactly one. That is what stops implication chains from
+    /// compounding, and it is also what makes step 1 above hold for implied nodes: a
+    /// single-signal technology's noisy-OR is just that signal's weight, so the value
+    /// recorded here is exactly what the final `filter_map` will recompute.
+    ///
+    /// # The arithmetic
+    ///
+    /// `weight = round(min(edge, IMPLIED_EDGE_CEILING) * parent_confidence / 100)`.
+    ///
+    /// Multiplying by the parent both DISCOUNTS and BOUNDS: the multiplier is at most
+    /// 0.9, so a child is always strictly below its parent, and a child that becomes a
+    /// parent at the next level is discounted again from its own already-reduced
+    /// figure. Chains therefore decay geometrically — WordPress at 55 implies PHP at
+    /// 50, which implies its own children at 45 — instead of every implication in the
+    /// graph landing on a flat 100.
+    ///
+    /// A weight that rounds to 0 is dropped rather than recorded: a zero-weight signal
+    /// contributes nothing to noisy-OR, so it would be a technology asserted on no
+    /// evidence, and enqueueing it would expand a whole subtree of the graph on the
+    /// strength of it. Reaching 0 needs a parent already at 0 or 1, which means the
+    /// parent barely exists either.
+    fn expand_implied(&self, detected: &mut HashMap<String, TechDetection>) {
+        // Confidence of every technology that can act as a parent, seeded with the
+        // directly detected ones and extended as the BFS discovers implied ones.
+        let mut confidence: HashMap<String, u8> = HashMap::with_capacity(detected.len());
+        for (name, detection) in detected.iter_mut() {
+            Self::dedupe_signals(&mut detection.signals);
+            confidence.insert(name.clone(), compute_noisy_or(&detection.signals));
+        }
+
+        // Sorted, not `keys()` order. Which parent claims a shared child is decided by
+        // the order the frontier is walked, and now decides that child's WEIGHT as
+        // well as its version, so leaving it to `HashMap` iteration order would make
+        // the reported confidence vary between runs on identical input. Sorting the
+        // seeds is enough to make the whole expansion deterministic: every later
+        // enqueue happens in `implies_graph` order, which is fixed.
+        let mut seeds: Vec<String> = detected.keys().cloned().collect();
+        seeds.sort();
+        let mut queue: std::collections::VecDeque<String> = seeds.into_iter().collect();
+
+        while let Some(parent_name) = queue.pop_front() {
+            let parent_confidence = match confidence.get(&parent_name) {
+                Some(c) => *c,
+                // Nothing computes a confidence-free entry into the queue today; if
+                // something ever does, implying from an unknown score is worse than
+                // not implying at all.
+                None => continue,
+            };
+            if parent_confidence == 0 {
+                continue;
+            }
+            let implied_list = match self.implies_graph.get(&parent_name) {
+                Some(list) => list,
+                None => continue,
+            };
+            for implied in implied_list {
+                if detected.contains_key(&implied.name) {
+                    continue;
+                }
+                let edge = implied.weight.min(IMPLIED_EDGE_CEILING);
+                let weight =
+                    ((u32::from(edge) * u32::from(parent_confidence)) as f64 / 100.0).round() as u8;
+                if weight == 0 {
+                    continue;
+                }
+                Self::update_detection(
+                    detected,
+                    &implied.name,
+                    "implied",
+                    &parent_name,
+                    weight,
+                    implied.version.clone(),
+                );
+                // Record the child's confidence so it can discount its own children.
+                // Read back through `compute_noisy_or` rather than reusing `weight`
+                // directly: the two are equal for a single-signal technology, but
+                // going through the function means a change to how signals are
+                // combined reaches this path automatically instead of silently
+                // diverging from the final score.
+                if let Some(child) = detected.get(&implied.name) {
+                    confidence.insert(implied.name.clone(), compute_noisy_or(&child.signals));
+                }
+                queue.push_back(implied.name.clone());
+            }
+        }
     }
 
     /// Extract version from regex captures using version pattern.
@@ -864,8 +1018,291 @@ impl TechnologyAnalyzer {
         None
     }
 
-    /// Record a detection signal and update the version if this is the first version seen.
-    /// `value` is truncated to 100 characters to keep signal payloads compact.
+    /// How much a version string is worth, given the kind of artifact it was read out of.
+    ///
+    /// A technology has one version slot and many layers that can fill it, so something
+    /// has to arbitrate. Until this function existed the arbiter was arrival order:
+    /// `update_detection` wrote a version only when the slot was still empty, and the
+    /// layer order in `analyze()` is fixed, so a `?ver=` cache-buster scraped off a
+    /// script tag permanently beat an exact version from a source map or from a
+    /// `/wp-includes/version.php` probe — both of which run later. That ordering is
+    /// almost exactly inverted relative to how reliable the sources are.
+    ///
+    /// # Where this ranking is applied, and where it is not
+    ///
+    /// Through exactly ONE predicate — [`Self::version_outranks`] — reached from three
+    /// places:
+    ///
+    /// - [`Self::update_detection`], which every layer funnels through. That covers
+    ///   arbitration WITHIN one detection map: the layers of `analyze()` competing with
+    ///   each other, the asset/source-map layers competing with each other, and the
+    ///   probe layer competing with itself.
+    /// - the two folds in `src/lib.rs` (`inspect_assets` and `probe_version_endpoints`,
+    ///   both via `merge_version_by_source_rank`) where one of those separate maps is
+    ///   merged into the already-built `Vec<Technology>`. That second site is not an
+    ///   extra refinement, it is load-bearing: the probe layer and the source-map layer
+    ///   fill FRESH maps of their own, so a `probe` or `source_map` version never meets
+    ///   the version `analyze()` stored until the fold. Before the fold was ranked, the
+    ///   two highest ranks in this function — the only two sources that read a version
+    ///   out of the running build itself — were the only ones that could never win.
+    ///
+    /// Two paths still settle a version collision without consulting this ranking, and
+    /// are named so the list above is not read as "everywhere":
+    ///
+    /// - `Self::merge_aliases` folds two spellings of one product into one entry and
+    ///   keeps the canonical entry's version whenever it already has one, i.e. it is
+    ///   still first-write-wins between the two spellings.
+    /// - `analyze_url`'s DNS append and `detect_favicon` build or extend a `Technology`
+    ///   directly rather than through a detection map. Neither supplies a version
+    ///   today, so neither has a collision to settle — but neither would be ranked if
+    ///   one ever did.
+    ///
+    /// Sanitisation is untouched by any of this and still happens exactly once, in
+    /// `finalize_gating`, over whichever string won: a better-sourced version is no
+    /// more exempt from `sanitize_version` than the one it displaced.
+    ///
+    /// The ranking below is ordered by ONE question: how directly does this string
+    /// describe the build that is actually running? Higher wins. The numbers are
+    /// ordinal only — nothing multiplies or adds them, they are compared with `>` —
+    /// and the gaps are there so a future source can be slotted in without renumbering.
+    ///
+    /// Nothing here touches confidence. A version's provenance says which *string* to
+    /// keep; the signal weight, and only the signal weight, says how sure we are the
+    /// technology is present at all.
+    ///
+    /// `value` is the signal's payload (for `script_src` and `url` layers, the asset
+    /// URL) and `version` the candidate string, both needed to tell a version parsed
+    /// out of a URL path from one lifted out of a query parameter — see
+    /// [`Self::version_is_from_query_string`].
+    pub(crate) fn version_source_rank(signal_type: &str, value: &str, version: &str) -> u8 {
+        match signal_type {
+            // The application answering a question about itself. `/wp-json/`,
+            // `/package.json`, `/actuator/info` and friends are fetched by the probe
+            // layer precisely because they disclose a version, and what they return is
+            // the running build's own statement of what it is. Nothing beats that.
+            "probe" => 100,
+
+            // A JavaScript source map's `sources` array carries literal
+            // `node_modules/<pkg>/<version>/...` paths emitted by the bundler at build
+            // time. Exact and unspoofable in practice — but one step below a probe
+            // because it names the version of a *dependency inside the bundle*, which
+            // for a vendored or transitively pinned package need not be the version of
+            // the product we are attributing it to.
+            "source_map" => 95,
+
+            // `<meta name="generator" content="WordPress 6.8.1">`. The application
+            // declaring its own version in its own markup: deliberate, usually right,
+            // and below a probe only because generator tags are routinely left stale
+            // by upgrades that do not rewrite the template, and are trivially edited
+            // or faked by hardening plugins.
+            "meta" => 80,
+
+            // `Server:`, `X-Powered-By:`, `X-Generator:`. Also a self-report, but one
+            // that is very often about the web server or language runtime in front of
+            // the application rather than the application, and that operators
+            // routinely truncate or blank.
+            "header" => 70,
+
+            // TXT records and the like. Published by the domain's operator, so it has
+            // real authority — but it describes an account or a zone configuration,
+            // not the build serving this particular response, and it goes stale
+            // silently. Every spelling in the tree is matched; see the same note in
+            // `confidence::independence_class`.
+            //
+            // Mostly precautionary: src/analyzer/layers/dns.rs builds its `Technology`
+            // values with `version: None` and never calls `update_detection`, so no DNS
+            // signal ever arrives here as a CANDIDATE. It can still be read here as
+            // part of an incumbent's evidence — `version_rank_from_signals` ranks every
+            // signal a technology carries — so the number is not unreachable, and the
+            // arm also means a DNS layer that one day does extract a version is ranked
+            // on purpose rather than falling into the unknown default below.
+            "dns" | "dns_txt" | "dns_mx" | "dns_cname" => 65,
+
+            // Cookie names and values. Version-bearing cookies exist (a few frameworks
+            // stamp a build id) but the convention is weak and the value is as often a
+            // session artifact as a version.
+            "cookie" => 60,
+
+            // A DOM rule reads a named attribute off a specific selector, e.g.
+            // `[data-version]` on a known root element. More targeted than a regex
+            // over the whole document, which is the only reason it sits above `html`.
+            "dom" => 55,
+
+            // Regexes over the response body: whole-document (`html`), inline script
+            // text (`script`), inline CSS (`css`), JS globals (`js`). This tier is
+            // wide: it holds both the best body evidence there is (a minifier-preserved
+            // `/*! jQuery v3.7.1 */` banner) and some of the loosest patterns in the
+            // database. They share a rank because the signal type does not distinguish
+            // the two, and inventing a finer split here would be guesswork.
+            "html" | "script" | "css" | "js" => 50,
+
+            // A version sitting in a URL *path* segment —
+            // `/ajax/libs/jquery/3.7.1/jquery.min.js`. Structured and conventional, so
+            // better than a query string, but it is a claim made by whoever chose the
+            // path, and CDN mirrors and rewrite rules are free to serve something else
+            // from it.
+            //
+            // A version lifted out of a *query parameter* is the weakest structured
+            // source there is. `?ver=` is a cache-buster: CMSs stamp their own core
+            // version onto every asset they enqueue, including third-party libraries
+            // that have nothing to do with that number, and themes stamp the theme
+            // version. `Self::extract_query_version` feeds exactly these into this
+            // function.
+            "script_src" | "url" => {
+                if Self::version_is_from_query_string(value, version) { 20 } else { 40 }
+            }
+
+            // Rendered page text. Prose that happens to contain something version
+            // shaped ("Powered by Foo 2.1") is the least controlled source we read:
+            // it is content, written by whoever writes the content. See
+            // `layers::text::TEXT_SIGNAL_WEIGHT` for the matching view of its weight.
+            "page-text" => 10,
+
+            // Not an observation at all. `ImpliedTech::version` is a constant written
+            // into the technology database's `implies` string, so it describes what
+            // the database author expected, not what this host is running. Anything
+            // actually observed should displace it.
+            "implied" => 5,
+
+            // Unrecognised or newly added signal type. Deliberately low but non-zero:
+            // a new layer can still fill an empty version slot (the `None` case in
+            // `update_detection` does not consult this function at all), and can still
+            // beat page text and an implication, but cannot silently displace a source
+            // whose trustworthiness someone has actually thought about. A new layer
+            // that deserves better gets an explicit arm above.
+            //
+            // `favicon` deliberately has no arm. The favicon layer maps a content hash
+            // to a technology *name*, never to a version, and it pushes its Signal
+            // straight onto the `Technology` rather than through `update_detection`
+            // (src/analyzer/layers/dns.rs), so it never offers a candidate. It does
+            // land in this default when an incumbent's rank is estimated from its
+            // signal list — the favicon layer runs before the probe layer, so a
+            // `favicon` signal is routinely present at the probe fold — and 15 is the
+            // right answer there: an identifier that carries no version must not raise
+            // the bar a real version source has to clear.
+            _ => 15,
+        }
+    }
+
+    /// True when `version` appears in `value`'s query string and NOT in its path.
+    ///
+    /// Used only to separate the two very different qualities of version that the
+    /// `script_src` and `url` layers both report: `/jquery/3.7.1/jquery.min.js` (path)
+    /// versus `/jquery.min.js?ver=6.5.3` (cache-buster).
+    ///
+    /// Note the deliberate asymmetry: if the string occurs on BOTH sides we treat it
+    /// as a path version, because a path that contains the number is corroboration,
+    /// not a cache-buster coincidence.
+    ///
+    /// When this is called to re-rank an ALREADY STORED signal the `value` it sees has
+    /// been truncated to 100 characters by `update_detection`, so a long URL may have
+    /// lost its `?` or its parameters. That degrades to `false`, i.e. to the higher
+    /// path rank, which makes the stored version harder to displace — the same
+    /// direction as the old first-write-wins behaviour, so truncation can never cause
+    /// a version to be replaced that would otherwise have been kept.
+    fn version_is_from_query_string(value: &str, version: &str) -> bool {
+        match value.find('?') {
+            None => false,
+            Some(q) => value[q + 1..].contains(version) && !value[..q].contains(version),
+        }
+    }
+
+    /// Best rank any signal in `signals` could have given to the version string
+    /// `version`.
+    ///
+    /// Neither `TechDetection` nor `Technology` records WHICH signal supplied the
+    /// string sitting in its single `version` field — both structs are defined in
+    /// src/types.rs and carry no provenance — so the rank of an already-stored version
+    /// cannot be looked up. It has to be recovered from the evidence list, and since
+    /// we cannot tell which entry produced it, this takes the maximum over all of
+    /// them. This is an approximation, not a measurement, and the two callers sit on
+    /// opposite sides of it, so the direction of the error matters in each:
+    ///
+    /// **Ranking the INCUMBENT** (both callers do this). The max over-estimates
+    /// whenever the entry also holds a higher-ranked signal that carried no version.
+    /// Over-estimating here is the safe direction: it can only make the stored version
+    /// HARDER to displace, so it never causes a replacement an exact tracker would not
+    /// also make. The worst case is declining an upgrade and keeping the old string —
+    /// exactly what the code did before any of this existed.
+    ///
+    /// **Ranking the CANDIDATE** (only the `src/lib.rs` folds do this; inside
+    /// `update_detection` the candidate's rank is computed exactly, from the
+    /// signal_type and value of the very call supplying it). Here the max is NOT
+    /// conservative: an inflated candidate rank can displace a version it should have
+    /// lost to. The exposure is one specific shape, and it is worth stating rather
+    /// than hiding:
+    ///
+    /// - The probe fold cannot hit it. Every signal `parse_probe_responses` emits has
+    ///   signal_type `probe`, so the max is taken over a single rank and equals it.
+    /// - The asset fold can. `inspect_assets` fills one map from two layers, so a
+    ///   technology may hold a `script_src` banner version (rank 40) alongside a
+    ///   versionless `source_map` signal (rank 95) — `try_source_map` emits exactly
+    ///   that when a `node_modules/<pkg>/` path names a package but no version could
+    ///   be parsed out of it. The rank-40 string is then judged at 95 and could
+    ///   displace a `meta` or `header` version that should have outranked it.
+    ///
+    /// Closing that gap properly means giving the detection a provenance field, which
+    /// means editing src/types.rs; it is deliberately left open rather than papered
+    /// over with a comment claiming the ranks are exact.
+    pub(crate) fn version_rank_from_signals(signals: &[Signal], version: &str) -> u8 {
+        signals
+            .iter()
+            .map(|signal| Self::version_source_rank(&signal.signal_type, &signal.value, version))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// THE version-precedence rule. Every place that has to choose between two
+    /// candidate version strings for one technology asks this and nothing else.
+    ///
+    /// It lives alone because it used to live in more than one place: the fold sites
+    /// in `src/lib.rs` carried their own `if t.version.is_none()` copy of the rule and
+    /// were simply never updated when ranking arrived, which is how `"probe" => 100`
+    /// came to be inert while the ranking table read as though it governed everything.
+    /// A precedence rule with three implementations has three behaviours.
+    ///
+    /// `candidate_rank` is supplied by the caller rather than computed here because
+    /// the callers know different amounts: `update_detection` has the exact
+    /// signal_type and value behind its candidate, while a fold site can only
+    /// approximate via [`Self::version_rank_from_signals`]. The comparison itself must
+    /// not differ between them, so only the comparison is here.
+    ///
+    /// A candidate must rank STRICTLY higher to win. Ties keep the incumbent, so among
+    /// equally trustworthy sources the first to arrive still wins: with one slot and
+    /// no way to tell two same-rank sources apart any other rule is just a different
+    /// arbitrary choice, and this one leaves the pre-existing behaviour untouched for
+    /// the common case where every candidate comes from the same tier.
+    pub(crate) fn version_outranks(
+        candidate_rank: u8,
+        incumbent: Option<&str>,
+        incumbent_signals: &[Signal],
+    ) -> bool {
+        match incumbent {
+            // Nothing to displace: any candidate at all beats an empty slot. Note that
+            // this arm never consults the ranking, which is why a layer with no arm in
+            // `version_source_rank` can still fill a version.
+            None => true,
+            Some(incumbent) => {
+                candidate_rank > Self::version_rank_from_signals(incumbent_signals, incumbent)
+            }
+        }
+    }
+
+    /// Record a detection signal, and keep the BEST-SOURCED version rather than the
+    /// first one to arrive.
+    ///
+    /// Every detection layer funnels through here, which is what makes it the right
+    /// place to arbitrate between version candidates: the layers stay pure evidence
+    /// producers and none of them has to know what any other layer found.
+    ///
+    /// A candidate replaces the stored version only if [`Self::version_outranks`] says
+    /// so — the same predicate the `src/lib.rs` folds use, so a version that loses here
+    /// loses there too. This function arbitrates only within ONE detection map; a probe
+    /// or source-map version competes with what `analyze()` found at the fold, not here.
+    ///
+    /// `value` is truncated to 100 characters to keep signal payloads compact. The
+    /// ranking above is computed from the UNTRUNCATED value, so the candidate is
+    /// judged on the whole URL even when only a prefix is retained as evidence.
     pub(crate) fn update_detection(
         detected: &mut HashMap<String, TechDetection>,
         tech_name: &str,
@@ -882,14 +1319,25 @@ impl TechnologyAnalyzer {
             version: None,
             signals: Vec::new(),
         });
+
+        // Resolved BEFORE this call's signal is appended, so that
+        // `version_rank_from_signals` sees only prior evidence. Appending first would let
+        // the candidate's own signal set the bar it then has to clear, and no candidate
+        // could ever win.
+        if let Some(candidate) = version {
+            // Exact candidate rank: this call knows the signal_type and the untruncated
+            // value that produced `candidate`, which the fold sites in src/lib.rs do not.
+            let candidate_rank = Self::version_source_rank(signal_type, value, &candidate);
+            if Self::version_outranks(candidate_rank, entry.version.as_deref(), &entry.signals) {
+                entry.version = Some(candidate);
+            }
+        }
+
         entry.signals.push(Signal {
             signal_type: signal_type.to_string(),
             value: value_trunc.to_string(),
             weight,
         });
-        if entry.version.is_none() && version.is_some() {
-            entry.version = version;
-        }
     }
 
     /// Pick the CPE for a technology, honouring explicit suppressions.
@@ -1247,6 +1695,7 @@ mod tests {
             version_patches: HashMap::new(),
             implies_graph: HashMap::new(),
             dom_rules: HashMap::new(),
+            text_patterns: HashMap::new(),
         }
     }
 
@@ -1554,6 +2003,229 @@ mod tests {
         TechnologyAnalyzer::apply_exclusions_and_requirements(&mut detected, &db);
 
         assert!(!detected.contains_key("TechX"), "TechX should be removed — required category not detected");
+    }
+
+    // ── version precedence (source quality, not arrival order) ───────────────
+
+    /// One `update_detection` call, so the tests below read as a sequence of layers
+    /// reporting what they found.
+    fn feed(
+        detected: &mut HashMap<String, TechDetection>,
+        signal_type: &str,
+        value: &str,
+        version: &str,
+    ) {
+        TechnologyAnalyzer::update_detection(
+            detected,
+            "WordPress",
+            signal_type,
+            value,
+            80,
+            Some(version.to_string()),
+        );
+    }
+
+    /// The whole point of ranking version sources: the better source must win no
+    /// matter which layer happened to run first.
+    ///
+    /// Both orderings are asserted deliberately. Under the old first-write-wins rule
+    /// the `(meta, then query param)` ordering already produced the right answer by
+    /// accident, so a test that only checked that ordering would pass against the bug
+    /// it is supposed to catch. It is the `(query param, then meta)` ordering that
+    /// bites — that is the real-world one, since `analyze_scripts` runs before
+    /// `analyze_meta_tags`.
+    ///
+    /// The scenario is the common WordPress one: every asset WordPress enqueues is
+    /// stamped with `?ver=<core version>` as a cache-buster, and that number goes
+    /// stale or gets frozen by caching plugins, while the generator meta tag is the
+    /// installation stating its own version.
+    #[test]
+    fn test_better_version_source_wins_in_either_arrival_order() {
+        let query_param = (
+            "script_src",
+            "https://example.com/wp-includes/js/wp-emoji-release.min.js?ver=6.5.3",
+            "6.5.3",
+        );
+        let meta_generator = ("meta", "generator: WordPress 6.8.1", "6.8.1");
+
+        for (first, second) in [(query_param, meta_generator), (meta_generator, query_param)] {
+            let mut detected: HashMap<String, TechDetection> = HashMap::new();
+            feed(&mut detected, first.0, first.1, first.2);
+            feed(&mut detected, second.0, second.1, second.2);
+
+            assert_eq!(
+                detected["WordPress"].version.as_deref(),
+                Some("6.8.1"),
+                "meta generator must beat a ?ver= cache-buster; order was {} then {}",
+                first.0,
+                second.0,
+            );
+            // Losing the version arbitration must not lose the evidence: both layers
+            // still observed WordPress, and confidence is computed from signals.
+            assert_eq!(detected["WordPress"].signals.len(), 2);
+        }
+    }
+
+    /// Within one signal type, a version in the URL path outranks one in the query
+    /// string — the distinction `version_is_from_query_string` exists to make. Both
+    /// of these arrive from `analyze_scripts` as `script_src`, so signal type alone
+    /// cannot separate them.
+    #[test]
+    fn test_path_version_outranks_query_version_within_script_src() {
+        let cdn_path = (
+            "script_src",
+            "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+            "3.7.1",
+        );
+        let cache_buster = ("script_src", "https://example.com/js/jquery.min.js?ver=1.2.3", "1.2.3");
+
+        for (first, second) in [(cdn_path, cache_buster), (cache_buster, cdn_path)] {
+            let mut detected: HashMap<String, TechDetection> = HashMap::new();
+            feed(&mut detected, first.0, first.1, first.2);
+            feed(&mut detected, second.0, second.1, second.2);
+            assert_eq!(
+                detected["WordPress"].version.as_deref(),
+                Some("3.7.1"),
+                "CDN path version must beat a query parameter; first was {}",
+                first.1,
+            );
+        }
+    }
+
+    /// Equal-rank candidates keep the incumbent — the documented tie rule.
+    #[test]
+    fn test_equal_rank_version_sources_keep_the_first() {
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        feed(&mut detected, "html", "<!-- built with 1.0.0 -->", "1.0.0");
+        feed(&mut detected, "html", "<!-- and also 2.0.0 -->", "2.0.0");
+        assert_eq!(detected["WordPress"].version.as_deref(), Some("1.0.0"));
+    }
+
+    /// An empty version slot is filled by whatever turns up, however poorly ranked.
+    /// Ranking arbitrates between candidates; it must never suppress the only one.
+    #[test]
+    fn test_weakest_source_still_fills_an_empty_version() {
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        TechnologyAnalyzer::update_detection(
+            &mut detected,
+            "WordPress",
+            "header",
+            "x-powered-by: wordpress",
+            90,
+            None,
+        );
+        feed(&mut detected, "page-text", "Proudly powered by WordPress 6.8.1", "6.8.1");
+        assert_eq!(detected["WordPress"].version.as_deref(), Some("6.8.1"));
+    }
+
+    // ── implied technologies are bounded by their parent ─────────────────────
+
+    fn implies(name: &str, weight: u8) -> ImpliedTech {
+        ImpliedTech { name: name.to_string(), weight, version: None }
+    }
+
+    /// An inference must never be more confident than the observation behind it, and
+    /// a chain of inferences must decay rather than hold flat.
+    ///
+    /// The graph here is the motivating real one, with the database's usual bare
+    /// `"implies"` entries that `build_implies_graph` defaults to weight 100: observe
+    /// WordPress weakly, and both PHP and (transitively) MySQL used to land at a flat
+    /// 100 — more confident than the only thing actually seen.
+    #[test]
+    fn test_implied_confidence_is_bounded_by_and_decays_from_its_parent() {
+        let mut analyzer = empty_analyzer();
+        analyzer.implies_graph.insert("WordPress".to_string(), vec![implies("PHP", 100)]);
+        analyzer.implies_graph.insert("PHP".to_string(), vec![implies("MySQL", 100)]);
+
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        TechnologyAnalyzer::update_detection(
+            &mut detected,
+            "WordPress",
+            "html",
+            "/wp-content/themes/x/style.css",
+            55,
+            None,
+        );
+
+        analyzer.expand_implied(&mut detected);
+
+        let score = |name: &str| compute_noisy_or(&detected[name].signals);
+        let parent = score("WordPress");
+        let child = score("PHP");
+        let grandchild = score("MySQL");
+
+        assert_eq!(parent, 55, "the only observation is a single weight-55 signal");
+        // round(90 * 55 / 100) = 50, round(90 * 50 / 100) = 45.
+        assert_eq!(child, 50);
+        assert_eq!(grandchild, 45);
+        assert!(child < parent, "an inference cannot beat its evidence");
+        assert!(grandchild < child, "a two-hop chain must decay, not hold flat");
+
+        // One implied signal each — the guard that stops chains compounding.
+        assert_eq!(detected["PHP"].signals.len(), 1);
+        assert_eq!(detected["MySQL"].signals.len(), 1);
+        assert_eq!(detected["PHP"].signals[0].signal_type, "implied");
+        assert_eq!(detected["PHP"].signals[0].value, "WordPress");
+        assert_eq!(detected["MySQL"].signals[0].value, "PHP");
+    }
+
+    /// An explicit `confidence:` below the ceiling is honoured as written, and still
+    /// scaled by the parent. The ceiling only removes the unearned default of 100.
+    #[test]
+    fn test_explicit_edge_confidence_is_scaled_not_replaced() {
+        let mut analyzer = empty_analyzer();
+        analyzer.implies_graph.insert("Parent".to_string(), vec![implies("Child", 50)]);
+
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        TechnologyAnalyzer::update_detection(&mut detected, "Parent", "html", "marker", 80, None);
+        analyzer.expand_implied(&mut detected);
+
+        // round(50 * 80 / 100) = 40 — the edge's own 50, discounted by the parent.
+        assert_eq!(compute_noisy_or(&detected["Child"].signals), 40);
+    }
+
+    /// A technology we actually observed keeps its own evidence and gains no implied
+    /// signal, however strongly something else implies it. Preserving this is what
+    /// stops a weak parent from dragging down a well-evidenced child.
+    #[test]
+    fn test_directly_detected_technology_receives_no_implied_signal() {
+        let mut analyzer = empty_analyzer();
+        analyzer.implies_graph.insert("WordPress".to_string(), vec![implies("PHP", 100)]);
+
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        TechnologyAnalyzer::update_detection(&mut detected, "WordPress", "html", "wp", 40, None);
+        TechnologyAnalyzer::update_detection(
+            &mut detected,
+            "PHP",
+            "header",
+            "x-powered-by: PHP/8.2.1",
+            100,
+            Some("8.2.1".to_string()),
+        );
+
+        analyzer.expand_implied(&mut detected);
+
+        assert_eq!(detected["PHP"].signals.len(), 1);
+        assert_eq!(detected["PHP"].signals[0].signal_type, "header");
+        assert_eq!(compute_noisy_or(&detected["PHP"].signals), 100);
+    }
+
+    /// A cycle in the graph must terminate. The `contains_key` guard is what does it:
+    /// the second time round, the technology is already present and is skipped.
+    #[test]
+    fn test_implies_cycle_terminates() {
+        let mut analyzer = empty_analyzer();
+        analyzer.implies_graph.insert("A".to_string(), vec![implies("B", 100)]);
+        analyzer.implies_graph.insert("B".to_string(), vec![implies("A", 100)]);
+
+        let mut detected: HashMap<String, TechDetection> = HashMap::new();
+        TechnologyAnalyzer::update_detection(&mut detected, "A", "html", "marker", 100, None);
+        analyzer.expand_implied(&mut detected);
+
+        assert_eq!(detected.len(), 2);
+        assert_eq!(detected["A"].signals.len(), 1);
+        assert_eq!(detected["B"].signals.len(), 1);
+        assert_eq!(compute_noisy_or(&detected["B"].signals), 90);
     }
 }
 

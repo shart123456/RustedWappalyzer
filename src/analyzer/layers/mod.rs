@@ -9,3 +9,4 @@ pub(crate) mod csp;
 pub(crate) mod dns;
 pub(crate) mod probes;
 pub(crate) mod dom;
+pub(crate) mod text;

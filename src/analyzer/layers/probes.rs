@@ -1482,6 +1482,7 @@ mod probe_parse_tests {
             version_patches: HashMap::new(),
             implies_graph: HashMap::new(),
             dom_rules: HashMap::new(),
+            text_patterns: HashMap::new(),
         }
     }
 

@@ -1,0 +1,65 @@
+{
+  "name": "nextcloud-28.0.1",
+  "image": "nextcloud:28.0.1-apache",
+  "captured_at": "2026-09-21T23:42:31Z",
+  "captured_by": "fixtures/capture_corpus.sh",
+  "capture_url": "http://127.0.0.1:38508/",
+  "effective_url": "http://127.0.0.1:38508/",
+  "notes": "SETUP PAGE. With no database configured Nextcloud serves the first-run setup wizard. Nextcloud sets several cookies on this page, which is exactly why set_cookie_headers is captured as a list rather than a joined string.",
+  "body_truncated": false,
+  "body_original_bytes": 6644,
+  "expect": [
+    {
+      "technology": "Nextcloud",
+      "version": "28.0.1",
+      "source": "image tag nextcloud:28.0.1-apache"
+    },
+    {
+      "technology": "Apache HTTP Server",
+      "version": "2.4.57",
+      "source": "exec_probe:apache"
+    },
+    {
+      "technology": "PHP",
+      "version": "8.2.15",
+      "source": "exec_probe:php"
+    }
+  ],
+  "response": {
+    "url": "http://127.0.0.1:38508/",
+    "headers": {
+      "date": "Mon, 21 Sep 2026 23:42:30 GMT",
+      "server": "Apache/2.4.57 (Debian)",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "SAMEORIGIN",
+      "x-permitted-cross-domain-policies": "none",
+      "x-robots-tag": "noindex, nofollow",
+      "x-xss-protection": "1; mode=block",
+      "x-powered-by": "PHP/8.2.15",
+      "expires": "Thu, 19 Nov 1981 08:52:00 GMT",
+      "cache-control": "no-store, no-cache, must-revalidate",
+      "pragma": "no-cache",
+      "content-security-policy": "default-src 'self'; script-src 'self' 'nonce-MHoxSGZNMFpsYklkcVVrL3lKSVdsVGJuckIyY0VWb0N2LzVCMERQK1RYYz06bTJjTUJxc2d3T0pVNmprTWtQOXMxbkxVd1hYR2VtcEd5Y29VdFVXSEhRRT0='; style-src 'self' 'unsafe-inline'; frame-src *; img-src * data: blob:; font-src 'self' data:; media-src *; connect-src *; object-src 'none'; base-uri 'self';",
+      "vary": "Accept-Encoding",
+      "content-length": "6644",
+      "content-type": "text/html; charset=UTF-8",
+      "set-cookie": "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax\noc_sessionPassphrase=FTnIBYFsLapnEM1Kv5FZ9xfWZ2g2jlYYyk3XspGJMBEdA%2F2or4a4VryQXSFL1JRqBQLBc1GLiJsFM%2FU53%2FFibo%2Fke1NIARRscv%2F%2FPQtulb3PvHZE2iYdDk3WX8gTE0tk; path=/; HttpOnly; SameSite=Lax\noczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax\nnc_sameSiteCookielax=true; path=/; httponly;expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=lax\nnc_sameSiteCookiestrict=true; path=/; httponly;expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=strict\noczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax\noczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax\noczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax\noczvjyvy6jeu=6130f4c52661921a6eccaf7fea0e1b3d; path=/; HttpOnly; SameSite=Lax\noczvjyvy6jeu=6130f4c52661921a6eccaf7fea0e1b3d; path=/; HttpOnly; SameSite=Lax"
+    },
+    "body": "<!DOCTYPE html>\n<html class=\"ng-csp\" data-placeholder-focus=\"false\" lang=\"en\" data-locale=\"en\" translate=\"no\" >\n\t<head\n data-requesttoken=\"0z1HfM0ZlbIdqUk/yJIWlTbnrB2cEVoCv/5B0DP+TXc=:m2cMBqsgwOJU6jkMkP9s1nLUwXXGempGycoUtUWHHQE=\">\n\t\t<meta charset=\"utf-8\">\n\t\t<title>\n\t\t\tNextcloud\t\t</title>\n\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, minimum-scale=1.0\">\n\t\t\t\t<meta name=\"apple-itunes-app\" content=\"app-id=1125420102\">\n\t\t\t\t<meta name=\"theme-color\" content=\"#0082c9\">\n\t\t<link rel=\"icon\" href=\"/core/img/favicon.ico\">\n\t\t<link rel=\"apple-touch-icon\" href=\"/core/img/favicon-touch.png\">\n\t\t<link rel=\"mask-icon\" sizes=\"any\" href=\"/core/img/favicon-mask.svg\" color=\"#0082c9\">\n\t\t<link rel=\"manifest\" href=\"/core/img/manifest.json\">\n\t\t<link rel=\"stylesheet\" href=\"/core/css/server.css?v=ba222ded25d957b900c03bef914333cd\">\n<link rel=\"stylesheet\" href=\"/apps/theming/css/default.css?v=ba222ded25d957b900c03bef914333cd\">\n<link rel=\"stylesheet\" href=\"/core/css/guest.css?v=ba222ded25d957b900c03bef914333cd\">\n\t\t<script nonce=\"MHoxSGZNMFpsYklkcVVrL3lKSVdsVGJuckIyY0VWb0N2LzVCMERQK1RYYz06bTJjTUJxc2d3T0pVNmprTWtQOXMxbkxVd1hYR2VtcEd5Y29VdFVXSEhRRT0=\" defer src=\"/dist/core-common.js?v=ba222ded25d957b900c03bef914333cd\"></script>\n<script nonce=\"MHoxSGZNMFpsYklkcVVrL3lKSVdsVGJuckIyY0VWb0N2LzVCMERQK1RYYz06bTJjTUJxc2d3T0pVNmprTWtQOXMxbkxVd1hYR2VtcEd5Y29VdFVXSEhRRT0=\" defer src=\"/dist/core-main.js?v=ba222ded25d957b900c03bef914333cd\"></script>\n<script nonce=\"MHoxSGZNMFpsYklkcVVrL3lKSVdsVGJuckIyY0VWb0N2LzVCMERQK1RYYz06bTJjTUJxc2d3T0pVNmprTWtQOXMxbkxVd1hYR2VtcEd5Y29VdFVXSEhRRT0=\" defer src=\"/dist/core-install.js?v=ba222ded25d957b900c03bef914333cd\"></script>\n\t\t\t</head>\n\t<body id=\"body-login\">\n\t\t<noscript>\n\t<div id=\"nojavascript\">\n\t\t<div>\n\t\t\tThis application requires JavaScript for correct operation. Please <a href=\"https://www.enable-javascript.com/\" target=\"_blank\" rel=\"noreferrer noopener\">enable JavaScript</a> and reload the page.\t\t</div>\n\t</div>\n</noscript>\n\t\t\t\t\t<input type=\"hidden\" id=\"initial-state-core-versionHash\" value=\"ImJhMjIyZGVkMjVkOTU3YjkwMGMwM2JlZjkxNDMzM2NkIg==\">\n\t\t\t\t<div class=\"wrapper\">\n\t\t\t<div class=\"v-align\">\n\t\t\t\t\t\t\t\t\t<header>\n\t\t\t\t\t\t<div id=\"header\">\n\t\t\t\t\t\t\t<div class=\"logo\"></div>\n\t\t\t\t\t\t</div>\n\t\t\t\t\t</header>\n\t\t\t\t\t\t\t\t<main>\n\t\t\t\t\t<h1 class=\"hidden-visually\">\n\t\t\t\t\t\tNextcloud\t\t\t\t\t</h1>\n\t\t\t\t\t<input type='hidden' id='hasMySQL' value='1'>\n<input type='hidden' id='hasSQLite' value='1'>\n<input type='hidden' id='hasPostgreSQL' value='1'>\n<input type='hidden' id='hasOracle' value=''>\n<form action=\"index.php\" method=\"post\" class=\"guest-box install-form\">\n<input type=\"hidden\" name=\"install\" value=\"true\">\n\t\t\t<fieldset id=\"adminaccount\">\n\t\t<legend>Create an <strong>admin account</strong></legend>\n\t\t<p>\n\t\t\t<label for=\"adminlogin\">Username</label>\n\t\t\t<input type=\"text\" name=\"adminlogin\" id=\"adminlogin\"\n\t\t\t\tvalue=\"\"\n\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" autofocus required>\n\t\t</p>\n\t\t<p class=\"groupbottom\">\n\t\t\t<label for=\"adminpass\">Password</label>\n\t\t\t<input type=\"password\" name=\"adminpass\" data-typetoggle=\"#show\" id=\"adminpass\"\n\t\t\t\tvalue=\"\"\n\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" required>\n\t\t\t<button id=\"show\" class=\"toggle-password\" aria-label=\"Show password\">\n\t\t\t\t<img src=\"/core/img/actions/toggle.svg\" alt=\"Toggle password visibility\">\n\t\t\t</button>\n\t\t</p>\n\t</fieldset>\n\n\t\t<fieldset id=\"advancedHeader\">\n\t\t<legend><a id=\"showAdvanced\" tabindex=\"0\" href=\"#\">Storage &amp; database<img src=\"/core/img/actions/caret.svg\" /></a></legend>\n\t</fieldset>\n\t\n\t\t<fieldset id=\"datadirField\">\n\t\t<div id=\"datadirContent\">\n\t\t\t<label for=\"directory\">Data folder</label>\n\t\t\t<input type=\"text\" name=\"directory\" id=\"directory\"\n\t\t\t\tplaceholder=\"/var/www/html/data\"\n\t\t\t\tvalue=\"/var/www/html/data\"\n\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\">\n\t\t</div>\n\t</fieldset>\n\t\n\t\t<fieldset id='databaseBackend'>\n\t\t\t\t<legend>Configure the database</legend>\n\t\t<div id=\"selectDbType\">\n\t\t\t\t\t\t<input type=\"radio\" name=\"dbtype\" value=\"sqlite\" id=\"sqlite\"\n\t\t\t/>\n\t\t<label class=\"sqlite\" for=\"sqlite\">SQLite</label>\n\t\t\t\t\t\t\t\t<input type=\"radio\" name=\"dbtype\" value=\"mysql\" id=\"mysql\"\n\t\t\t/>\n\t\t<label class=\"mysql\" for=\"mysql\">MySQL/MariaDB</label>\n\t\t\t\t\t\t\t\t<input type=\"radio\" name=\"dbtype\" value=\"pgsql\" id=\"pgsql\"\n\t\t\t/>\n\t\t<label class=\"pgsql\" for=\"pgsql\">PostgreSQL</label>\n\t\t\t\t\t\t</div>\n\t</fieldset>\n\n\t\t\t\t<fieldset id='databaseField'>\n\t\t<div id=\"use_other_db\">\n\t\t\t<p class=\"grouptop\">\n\t\t\t\t<label for=\"dbuser\">Database user</label>\n\t\t\t\t<input type=\"text\" name=\"dbuser\" id=\"dbuser\"\n\t\t\t\t\tvalue=\"\"\n\t\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\">\n\t\t\t</p>\n\t\t\t<p class=\"groupmiddle\">\n\t\t\t\t<label for=\"dbpass\">Database password</label>\n\t\t\t\t<input type=\"password\" name=\"dbpass\" id=\"dbpass\"\n\t\t\t\t\tvalue=\"\"\n\t\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\">\n\t\t\t\t<button id=\"show\" class=\"toggle-password\" aria-label=\"Show password\">\n\t\t\t\t\t<img src=\"/core/img/actions/toggle.svg\" alt=\"Toggle password visibility\">\n\t\t\t\t</button>\n\t\t\t</p>\n\t\t\t<p class=\"groupmiddle\">\n\t\t\t\t<label for=\"dbname\">Database name</label>\n\t\t\t\t<input type=\"text\" name=\"dbname\" id=\"dbname\"\n\t\t\t\t\tvalue=\"\"\n\t\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\"\n\t\t\t\t\tpattern=\"[0-9a-zA-Z$_-]+\">\n\t\t\t</p>\n\t\t\t\t\t\t<p class=\"groupbottom\">\n\t\t\t\t<label for=\"dbhost\">Database host</label>\n\t\t\t\t<input type=\"text\" name=\"dbhost\" id=\"dbhost\"\n\t\t\t\t\tvalue=\"localhost\"\n\t\t\t\t\tautocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\">\n\t\t\t</p>\n\t\t\t<p class=\"info\">\n\t\t\t\tPlease specify the port number along with the host name (e.g., localhost:5432).\t\t\t</p>\n\t\t</div>\n\t\t</fieldset>\n\t\t\t\n\t\t\t<div id=\"sqliteInformation\" class=\"notecard warning\">\n\t\t\t<legend>Performance warning</legend>\n\t\t\t<p>You chose SQLite as database.</p>\n\t\t\t<p>SQLite should only be used for minimal and development instances. For production we recommend a different database backend.</p>\n\t\t\t<p>If you use clients for file syncing, the use of SQLite is highly discouraged.</p>\n\t\t</div>\n\t\n\t<div class=\"icon-loading-dark float-spinner\">&nbsp;</div>\n\n\t<div class=\"buttons\"><input type=\"submit\" class=\"primary\" value=\"Install\" data-finishing=\"Installing \u2026\"></div>\n\n\t<p class=\"info\">\n\t\t<span class=\"icon-info-white\"></span>\n\t\tNeed help?\t\t<a target=\"_blank\" rel=\"noreferrer noopener\" href=\"https://docs.nextcloud.com/server/28/go.php?to=admin-install\">See the documentation \u2197</a>\n\t</p>\n</form>\n\t\t\t\t</main>\n\t\t\t</div>\n\t\t</div>\n\t\t\t\t<footer class=\"guest-box \">\n\t\t\t<p class=\"info\">\n\t\t\t\t<a href=\"https://nextcloud.com\" target=\"_blank\" rel=\"noreferrer noopener\">Nextcloud</a> \u2013 a safe home for all your data\t\t\t</p>\n\t\t</footer>\n\t</body>\n</html>\n",
+    "status_code": 200,
+    "response_time_ms": 12,
+    "set_cookie_headers": [
+      "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax",
+      "oc_sessionPassphrase=FTnIBYFsLapnEM1Kv5FZ9xfWZ2g2jlYYyk3XspGJMBEdA%2F2or4a4VryQXSFL1JRqBQLBc1GLiJsFM%2FU53%2FFibo%2Fke1NIARRscv%2F%2FPQtulb3PvHZE2iYdDk3WX8gTE0tk; path=/; HttpOnly; SameSite=Lax",
+      "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax",
+      "nc_sameSiteCookielax=true; path=/; httponly;expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=lax",
+      "nc_sameSiteCookiestrict=true; path=/; httponly;expires=Fri, 31-Dec-2100 23:59:59 GMT; SameSite=strict",
+      "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax",
+      "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax",
+      "oczvjyvy6jeu=4da8b293778ad74cd7bd297a1f3a6068; path=/; HttpOnly; SameSite=Lax",
+      "oczvjyvy6jeu=6130f4c52661921a6eccaf7fea0e1b3d; path=/; HttpOnly; SameSite=Lax",
+      "oczvjyvy6jeu=6130f4c52661921a6eccaf7fea0e1b3d; path=/; HttpOnly; SameSite=Lax"
+    ]
+  }
+}

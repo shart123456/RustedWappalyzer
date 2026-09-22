@@ -1,0 +1,34 @@
+{
+  "name": "httpd-2.4.58",
+  "image": "httpd:2.4.58",
+  "captured_at": "2026-09-21T23:39:59Z",
+  "captured_by": "fixtures/capture_corpus.sh",
+  "capture_url": "http://127.0.0.1:38502/",
+  "effective_url": "http://127.0.0.1:38502/",
+  "notes": "Stock Apache 'It works!' page. The official httpd image leaves ServerTokens at its default (Full), so the Server header carries the full version.",
+  "body_truncated": false,
+  "body_original_bytes": 45,
+  "expect": [
+    {
+      "technology": "Apache HTTP Server",
+      "version": "2.4.58",
+      "source": "image tag httpd:2.4.58"
+    }
+  ],
+  "response": {
+    "url": "http://127.0.0.1:38502/",
+    "headers": {
+      "date": "Mon, 21 Sep 2026 23:39:59 GMT",
+      "server": "Apache/2.4.58 (Unix)",
+      "last-modified": "Mon, 11 Jun 2007 18:53:14 GMT",
+      "etag": "\"2d-432a5e4a73a80\"",
+      "accept-ranges": "bytes",
+      "content-length": "45",
+      "content-type": "text/html"
+    },
+    "body": "<html><body><h1>It works!</h1></body></html>\n",
+    "status_code": 200,
+    "response_time_ms": 0,
+    "set_cookie_headers": []
+  }
+}

@@ -1,0 +1,371 @@
+{
+  "_comment": [
+    "Ground truth for the detection corpus. THIS FILE IS THE SPEC; the analyzer is the",
+    "thing under test. Every `expect` entry is derived from the Docker image tag (or from",
+    "a command run INSIDE the container via `exec_probes`), never from what the analyzer",
+    "happens to report. `docker run nginx:1.25.3` is Nginx 1.25.3 by definition -- that is",
+    "the only reason this corpus is trustworthy as a scoreboard.",
+    "",
+    "Every `technology` value below was checked against wappalyzer_cache.json before being",
+    "written here: an expectation naming a technology the database does not define can never",
+    "pass, it can only drag the floor down for no reason.",
+    "",
+    "DELIBERATELY ABSENT IMAGES: traefik, prom/prometheus, hashicorp/consul and",
+    "hashicorp/vault were pulled and then skipped. The shipped database (7,586 technologies)",
+    "has no entry for Traefik, Prometheus, Consul or Vault -- grep wappalyzer_cache.json and",
+    "you will find nothing. There is no expectation that could be written for them that the",
+    "engine is even capable of satisfying, so capturing them would add bytes and noise",
+    "without adding signal. Re-add them the day those technologies land in the database."
+  ],
+  "fixtures": [
+    {
+      "name": "nginx-1.25.3",
+      "image": "nginx:1.25.3",
+      "container_port": 80,
+      "host_port": 38501,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 60,
+      "notes": "Stock nginx welcome page. Simplest possible case: the version is in the Server header.",
+      "expect": [
+        {
+          "technology": "Nginx",
+          "version": "1.25.3",
+          "source": "image tag nginx:1.25.3"
+        }
+      ]
+    },
+    {
+      "name": "httpd-2.4.58",
+      "image": "httpd:2.4.58",
+      "container_port": 80,
+      "host_port": 38502,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 60,
+      "notes": "Stock Apache 'It works!' page. The official httpd image leaves ServerTokens at its default (Full), so the Server header carries the full version.",
+      "expect": [
+        {
+          "technology": "Apache HTTP Server",
+          "version": "2.4.58",
+          "source": "image tag httpd:2.4.58"
+        }
+      ]
+    },
+    {
+      "name": "grafana-10.2.3",
+      "image": "grafana/grafana:10.2.3",
+      "container_port": 3000,
+      "host_port": 38503,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 90,
+      "notes": "GET / redirects to /login; the captured page is the unauthenticated login screen.",
+      "expect": [
+        {
+          "technology": "Grafana",
+          "version": "10.2.3",
+          "source": "image tag grafana/grafana:10.2.3"
+        }
+      ]
+    },
+    {
+      "name": "gitea-1.21.3",
+      "image": "gitea/gitea:1.21.3",
+      "container_port": 3000,
+      "host_port": 38504,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 90,
+      "notes": "INSTALLER PAGE. With no database configured Gitea redirects / to /install. That page is still served by Gitea and still carries its fingerprints, but it is NOT a running forge -- do not read a miss here as 'Gitea is undetectable on real sites'.",
+      "expect": [
+        {
+          "technology": "Gitea",
+          "version": "1.21.3",
+          "source": "image tag gitea/gitea:1.21.3"
+        }
+      ]
+    },
+    {
+      "name": "wordpress-6.4.2",
+      "image": "wordpress:6.4.2-apache",
+      "container_port": 80,
+      "host_port": 38505,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 90,
+      "notes": "INSTALLER PAGE. Without MySQL, / redirects to /wp-admin/install.php (the 'choose your language' step). The meta generator and the wp-admin asset paths are present; a real site's theme/plugin fingerprints are not.",
+      "expect": [
+        {
+          "technology": "WordPress",
+          "version": "6.4.2",
+          "source": "image tag wordpress:6.4.2-apache"
+        },
+        {
+          "technology": "Apache HTTP Server",
+          "version": null,
+          "source": "exec_probe:apache"
+        },
+        {
+          "technology": "PHP",
+          "version": null,
+          "source": "exec_probe:php"
+        }
+      ],
+      "exec_probes": [
+        {
+          "id": "apache",
+          "technology": "Apache HTTP Server",
+          "cmd": [
+            "apache2",
+            "-v"
+          ],
+          "regex": "Apache/([0-9]+(?:\\.[0-9]+)+)"
+        },
+        {
+          "id": "php",
+          "technology": "PHP",
+          "cmd": [
+            "php",
+            "-v"
+          ],
+          "regex": "^PHP ([0-9]+(?:\\.[0-9]+)+)"
+        }
+      ]
+    },
+    {
+      "name": "drupal-10.2.1",
+      "image": "drupal:10.2.1-apache",
+      "container_port": 80,
+      "host_port": 38506,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 90,
+      "notes": "INSTALLER PAGE. / redirects to /core/install.php. NOTE for whoever reads the version score: Drupal's meta generator only ever emits the MAJOR version ('Drupal 10'), so an exact match against 10.2.1 is not achievable from HTML alone -- the test scores that as a PARTIAL match on purpose.",
+      "expect": [
+        {
+          "technology": "Drupal",
+          "version": "10.2.1",
+          "source": "image tag drupal:10.2.1-apache"
+        },
+        {
+          "technology": "Apache HTTP Server",
+          "version": null,
+          "source": "exec_probe:apache"
+        },
+        {
+          "technology": "PHP",
+          "version": null,
+          "source": "exec_probe:php"
+        }
+      ],
+      "exec_probes": [
+        {
+          "id": "apache",
+          "technology": "Apache HTTP Server",
+          "cmd": [
+            "apache2",
+            "-v"
+          ],
+          "regex": "Apache/([0-9]+(?:\\.[0-9]+)+)"
+        },
+        {
+          "id": "php",
+          "technology": "PHP",
+          "cmd": [
+            "php",
+            "-v"
+          ],
+          "regex": "^PHP ([0-9]+(?:\\.[0-9]+)+)"
+        }
+      ]
+    },
+    {
+      "name": "joomla-5.0.2",
+      "image": "joomla:5.0.2-apache",
+      "container_port": 80,
+      "host_port": 38507,
+      "path": "/",
+      "run_args": [
+        "--entrypoint",
+        "sh"
+      ],
+      "ready_timeout_secs": 120,
+      "notes": "INSTALLER PAGE, captured with the image's ENTRYPOINT DELIBERATELY BYPASSED. The joomla entrypoint runs makedb.php first and refuses to hand over to Apache until a MySQL server answers, so the stock `docker run joomla:5.0.2-apache` exits before serving anything and a database sidecar would be the only alternative. The cmd below does exactly what the entrypoint does for the web root -- copies /usr/src/joomla verbatim into /var/www/html -- and then starts Apache, so the page captured is the unmodified Joomla 5.0.2 installer as shipped in the image. Nothing about the served files is synthesised; only the database wait is skipped.",
+      "expect": [
+        {
+          "technology": "Joomla",
+          "version": "5.0.2",
+          "source": "image tag joomla:5.0.2-apache"
+        },
+        {
+          "technology": "Apache HTTP Server",
+          "version": null,
+          "source": "exec_probe:apache"
+        },
+        {
+          "technology": "PHP",
+          "version": null,
+          "source": "exec_probe:php"
+        }
+      ],
+      "exec_probes": [
+        {
+          "id": "apache",
+          "technology": "Apache HTTP Server",
+          "cmd": [
+            "apache2",
+            "-v"
+          ],
+          "regex": "Apache/([0-9]+(?:\\.[0-9]+)+)"
+        },
+        {
+          "id": "php",
+          "technology": "PHP",
+          "cmd": [
+            "php",
+            "-v"
+          ],
+          "regex": "^PHP ([0-9]+(?:\\.[0-9]+)+)"
+        }
+      ],
+      "cmd": [
+        "-c",
+        "cp -a /usr/src/joomla/. /var/www/html/ && exec apache2-foreground"
+      ]
+    },
+    {
+      "name": "nextcloud-28.0.1",
+      "image": "nextcloud:28.0.1-apache",
+      "container_port": 80,
+      "host_port": 38508,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 120,
+      "notes": "SETUP PAGE. With no database configured Nextcloud serves the first-run setup wizard. Nextcloud sets several cookies on this page, which is exactly why set_cookie_headers is captured as a list rather than a joined string.",
+      "expect": [
+        {
+          "technology": "Nextcloud",
+          "version": "28.0.1",
+          "source": "image tag nextcloud:28.0.1-apache"
+        },
+        {
+          "technology": "Apache HTTP Server",
+          "version": null,
+          "source": "exec_probe:apache"
+        },
+        {
+          "technology": "PHP",
+          "version": null,
+          "source": "exec_probe:php"
+        }
+      ],
+      "exec_probes": [
+        {
+          "id": "apache",
+          "technology": "Apache HTTP Server",
+          "cmd": [
+            "apache2",
+            "-v"
+          ],
+          "regex": "Apache/([0-9]+(?:\\.[0-9]+)+)"
+        },
+        {
+          "id": "php",
+          "technology": "PHP",
+          "cmd": [
+            "php",
+            "-v"
+          ],
+          "regex": "^PHP ([0-9]+(?:\\.[0-9]+)+)"
+        }
+      ]
+    },
+    {
+      "name": "mediawiki-1.41.0",
+      "image": "mediawiki:1.41.0",
+      "container_port": 80,
+      "host_port": 38509,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 90,
+      "notes": "SETUP PAGE. Without LocalSettings.php MediaWiki serves mw-config/index.php (the installer).",
+      "expect": [
+        {
+          "technology": "MediaWiki",
+          "version": "1.41.0",
+          "source": "image tag mediawiki:1.41.0"
+        },
+        {
+          "technology": "Apache HTTP Server",
+          "version": null,
+          "source": "exec_probe:apache"
+        },
+        {
+          "technology": "PHP",
+          "version": null,
+          "source": "exec_probe:php"
+        }
+      ],
+      "exec_probes": [
+        {
+          "id": "apache",
+          "technology": "Apache HTTP Server",
+          "cmd": [
+            "apache2",
+            "-v"
+          ],
+          "regex": "Apache/([0-9]+(?:\\.[0-9]+)+)"
+        },
+        {
+          "id": "php",
+          "technology": "PHP",
+          "cmd": [
+            "php",
+            "-v"
+          ],
+          "regex": "^PHP ([0-9]+(?:\\.[0-9]+)+)"
+        }
+      ]
+    },
+    {
+      "name": "jenkins-2.440",
+      "image": "jenkins/jenkins:2.440",
+      "container_port": 8080,
+      "host_port": 38510,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 180,
+      "notes": "Jenkins answers an unauthenticated / with 403 and its 'Authentication required' page until the first-run setup wizard is unlocked, so that 403 -- headers and all -- is what this fixture holds. That is a realistic capture: a locked-down Jenkins on the public internet looks exactly like this. Jetty is expected WITHOUT a version because the image tag pins Jenkins, not the bundled servlet container; the response happens to name a Jetty version in its Server header, but a ground-truth file must not take the target's word for anything, so no version is asserted.",
+      "expect": [
+        {
+          "technology": "Jenkins",
+          "version": "2.440",
+          "source": "image tag jenkins/jenkins:2.440"
+        },
+        {
+          "technology": "Jetty",
+          "version": null,
+          "source": "bundled servlet container; version not pinned by the image tag"
+        }
+      ]
+    },
+    {
+      "name": "sonarqube-10.3",
+      "image": "sonarqube:10.3-community",
+      "container_port": 9000,
+      "host_port": 38511,
+      "path": "/",
+      "run_args": [],
+      "ready_timeout_secs": 240,
+      "notes": "SonarQube boots an embedded Elasticsearch before it listens, so it is the slowest fixture in the corpus by a wide margin. The tag pins the MINOR version only (10.3), so the recorded ground-truth version is '10.3'.",
+      "expect": [
+        {
+          "technology": "SonarQube",
+          "version": "10.3",
+          "source": "image tag sonarqube:10.3-community"
+        }
+      ]
+    }
+  ]
+}
