@@ -39,6 +39,270 @@ use regex::Regex;
 pub mod analyzer;
 pub use analyzer::TechnologyAnalyzer;
 
+/// Number of leading bytes requested from each linked JS/CSS asset.
+///
+/// Asset inspection needs a window, not the whole bundle: the patterns it runs are
+/// library banners (`/*! jQuery v3.7.1 ... */`), bundler markers and inline version
+/// strings, and minifiers emit all of those at the top of the file. 16 KB comfortably
+/// covers a minified bundle's license-header block plus the start of the code.
+pub const ASSET_HEAD_BYTES: usize = 16 * 1024;
+
+/// Number of trailing bytes requested from each linked JS asset, in a second `Range`
+/// request, so that the `//# sourceMappingURL=` comment is visible.
+///
+/// Every bundler in common use (webpack, rollup, esbuild, vite, terser) APPENDS that
+/// comment as the last line of the file it emits. On any bundle larger than
+/// [`ASSET_HEAD_BYTES`] the comment therefore falls outside the head window, and
+/// `TechnologyAnalyzer::try_source_map` — which looks for it in the body it is handed
+/// — could never fire at all. Measured on a real target while fixing this: the
+/// vercel.com main bundle is 36,100 bytes with `sourceMappingURL` at byte 36,063, i.e.
+/// 37 bytes from EOF and roughly 20 KB past the end of the head window.
+///
+/// That path is worth keeping alive because a source map is the highest-precision
+/// version signal in this tool: its `sources` array contains literal
+/// `node_modules/<pkg>/<version>/...` paths, which is a ground-truth dependency
+/// inventory rather than a regex guess.
+///
+/// 2 KB is generous for a trailing comment (a `sourceMappingURL` line is typically
+/// under 100 bytes); the slack absorbs whatever else a bundler emits after the last
+/// statement, such as a webpack runtime epilogue or a trailing `//# sourceURL=`.
+pub const ASSET_TAIL_BYTES: usize = 2 * 1024;
+
+/// Cache key under which an asset's TAIL window is stored.
+///
+/// The asset cache is keyed by URL and that key holds the HEAD window, so the tail
+/// needs a key of its own — otherwise the two windows would overwrite each other and a
+/// later reader could not tell which one it got back, feeding end-of-file bytes to
+/// `analyze_asset` as if they were the start of the file (or vice versa).
+///
+/// The separator is a NUL byte. RFC 3986 admits no control character anywhere in a URI,
+/// so a well-formed asset URL cannot contain one; the relative-href branch of
+/// `inspect_assets` additionally builds its URLs through `url::Url::join`, whose
+/// serialisation percent-encodes a NUL as `%00`. The absolute-href branch does pass the
+/// `src` attribute through verbatim, so the guarantee ultimately rests on the page not
+/// embedding a raw NUL inside a `src="http://…"` — which no browser would load either.
+/// Short of that, the head and tail key spaces are disjoint.
+fn asset_tail_cache_key(url: &str) -> String {
+    format!("{}\u{0}tail", url)
+}
+
+/// Decide, from a 206 response's `Content-Range`, whether the head window we just
+/// received is in fact the whole asset.
+///
+/// The header's form is `bytes <start>-<end>/<total>` (RFC 9110 §14.4), where `<total>`
+/// may be `*` when the server does not know the full length. We return `true` only when
+/// the range provably reaches the end of a known total. An absent, malformed or `*`
+/// total is treated as "there may be more", which costs at most one extra suffix-range
+/// request and can never cost a missed source map.
+fn content_range_covers_whole_body(headers: &reqwest::header::HeaderMap) -> bool {
+    let raw = match headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v.trim(),
+        None => return false,
+    };
+    // The unit token is almost always "bytes"; tolerate its absence rather than reject.
+    let spec = raw.strip_prefix("bytes").map(|s| s.trim()).unwrap_or(raw);
+    let (range, total) = match spec.split_once('/') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let total: u64 = match total.trim().parse() {
+        Ok(t) => t,
+        Err(_) => return false, // "*" (unknown length) lands here, deliberately
+    };
+    let end: u64 = match range
+        .trim()
+        .split_once('-')
+        .and_then(|(_, end)| end.trim().parse().ok())
+    {
+        Some(e) => e,
+        None => return false,
+    };
+    end.saturating_add(1) >= total
+}
+
+/// Fetch the window(s) of a linked asset that detection actually reads: always the
+/// first [`ASSET_HEAD_BYTES`], and — when `want_tail` is set and the asset is known to
+/// be longer than that — the last [`ASSET_TAIL_BYTES`] as well.
+///
+/// Returns `(head, tail)`, where `tail` is `None` when the head already holds the whole
+/// asset, when the caller did not ask for one, or when the server refused the suffix
+/// range. A refused tail is never fatal: the head is still returned and analysis
+/// continues, because losing the source map is strictly less bad than losing the asset.
+///
+/// Range handling, in the three shapes servers actually produce:
+/// - **206 + `Content-Range`** — the normal case. The header says how big the file is,
+///   so we know whether a tail request is needed without guessing.
+/// - **200** — the server ignored `Range` and sent the entire body. There is then
+///   nothing left to fetch, so the tail request is skipped entirely rather than being
+///   issued and answered with a second full copy of the file.
+/// - **416 / 400 / anything else on the TAIL request** — some servers and CDNs reject
+///   suffix ranges (`bytes=-2048`) even though they accept `bytes=0-`. That is logged
+///   and treated as "no tail".
+///
+/// Both windows go through the shared asset cache, under distinct keys (see
+/// [`asset_tail_cache_key`]). A cached tail whose value is EMPTY is a sentinel meaning
+/// "the head is the whole asset, do not ask again": without it, every asset smaller
+/// than the head window would cost a wasted round trip on each analysis that links it,
+/// since the head cache entry alone does not record how the server answered.
+async fn fetch_asset_windows(
+    client: &reqwest::Client,
+    url: &str,
+    cache: &moka::sync::Cache<String, Arc<String>>,
+    timeout_secs: u64,
+    want_tail: bool,
+) -> Option<(Arc<String>, Option<Arc<String>>)> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    // --- head window ---
+    // `None` means "served from cache, so we never saw the status line"; the length
+    // heuristic below stands in for the Content-Range we no longer have.
+    let (head, head_is_whole_asset): (Arc<String>, Option<bool>) = match cache.get(url) {
+        Some(cached) => (cached, None),
+        None => {
+            let resp = match client
+                .get(url)
+                .header("Range", format!("bytes=0-{}", ASSET_HEAD_BYTES - 1))
+                .timeout(timeout)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(url = %url, "asset fetch failed: {}", e);
+                    return None;
+                }
+            };
+            let status = resp.status().as_u16();
+            if status != 200 && status != 206 {
+                tracing::debug!(url = %url, status = status, "asset fetch returned unusable status");
+                return None;
+            }
+            // 200 means the server ignored `Range` and handed over the complete file.
+            let whole = status == 200 || content_range_covers_whole_body(resp.headers());
+            let content = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(url = %url, "asset body read failed: {}", e);
+                    return None;
+                }
+            };
+            let arc = Arc::new(content);
+            cache.insert(url.to_string(), Arc::clone(&arc));
+            (arc, Some(whole))
+        }
+    };
+
+    if !want_tail {
+        return Some((head, None));
+    }
+
+    let tail_key = asset_tail_cache_key(url);
+    if let Some(cached_tail) = cache.get(&tail_key) {
+        // Empty is the "no tail exists" sentinel described above, not a tail of length 0.
+        let tail = if cached_tail.is_empty() { None } else { Some(cached_tail) };
+        return Some((head, tail));
+    }
+
+    // For a cache hit we no longer have the status line, so fall back on length: a
+    // truncated head is exactly the size of the window we asked for, while a complete
+    // one is shorter. (A body that happens to be exactly ASSET_HEAD_BYTES long costs one
+    // needless suffix request; a decoded body that is *longer* than the window — which a
+    // transfer-encoding could produce — is treated as truncated, which is the safe way
+    // round.)
+    let head_is_whole_asset =
+        head_is_whole_asset.unwrap_or_else(|| head.len() < ASSET_HEAD_BYTES);
+    if head_is_whole_asset {
+        cache.insert(tail_key, Arc::new(String::new()));
+        return Some((head, None));
+    }
+
+    // --- tail window ---
+    let resp = match client
+        .get(url)
+        .header("Range", format!("bytes=-{}", ASSET_TAIL_BYTES))
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(url = %url, "asset tail fetch failed: {}", e);
+            return Some((head, None));
+        }
+    };
+    let status = resp.status().as_u16();
+    if status != 200 && status != 206 {
+        // 416 (Range Not Satisfiable) and 400 both show up here from servers that only
+        // support a prefix range. Nothing is silently dropped: the head is still used.
+        tracing::debug!(url = %url, status = status, "asset tail range refused");
+        return Some((head, None));
+    }
+    let tail = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(url = %url, "asset tail body read failed: {}", e);
+            return Some((head, None));
+        }
+    };
+    let arc = Arc::new(tail);
+    cache.insert(tail_key, Arc::clone(&arc));
+    Some((head, Some(arc)))
+}
+
+/// Fold an incoming detection's version into an already-built [`Technology`], keeping
+/// the better-sourced string rather than the one that happened to arrive first.
+///
+/// Both late layers that can produce a version — the probe layer and the source-map
+/// layer — accumulate their findings in a FRESH `HashMap<String, TechDetection>` and
+/// only meet the technology list here. So this fold, not
+/// `TechnologyAnalyzer::update_detection`, is where a `/wp-includes/version.php` probe
+/// result actually competes with the `?ver=` cache-buster that `analyze()` scraped off
+/// a script tag. The two sites used to read `if t.version.is_none()`, i.e.
+/// first-write-wins, which meant the probe result was dropped unread and the two
+/// highest entries in `TechnologyAnalyzer::version_source_rank` — `probe` and
+/// `source_map` — could not arbitrate anything at all.
+///
+/// The decision itself is deliberately NOT implemented here: it is
+/// `TechnologyAnalyzer::version_outranks`, shared with `update_detection`. One rule,
+/// one implementation — the defect this function exists to repair was created by a
+/// second copy of the rule drifting out of step with the first.
+///
+/// Note what is approximated. `TechDetection` does not record which of its signals
+/// produced its version, so the candidate's rank is the maximum rank over the incoming
+/// signals (`version_rank_from_signals`, whose doc comment states the error direction
+/// on each side). For the probe fold that maximum is exact, because every signal the
+/// probe layer emits has signal_type `probe`. For the asset fold it can be an
+/// over-estimate, since `inspect_assets` fills one map from two layers of different
+/// rank.
+///
+/// Sanitisation is not skipped by taking this path: whichever string wins is
+/// `sanitize_version`-ed later, once, in `TechnologyAnalyzer::finalize_gating`, which
+/// runs after both folds.
+fn merge_version_by_source_rank(
+    tech: &mut Technology,
+    candidate: Option<String>,
+    candidate_signals: &[Signal],
+) {
+    if let Some(candidate) = candidate {
+        let candidate_rank =
+            TechnologyAnalyzer::version_rank_from_signals(candidate_signals, &candidate);
+        // `tech.signals` is the incumbent's evidence and does not yet include the
+        // incoming signals: callers extend it AFTER this returns, exactly as
+        // `update_detection` appends its signal after deciding, so that a candidate
+        // cannot raise the bar it then has to clear.
+        if TechnologyAnalyzer::version_outranks(
+            candidate_rank,
+            tech.version.as_deref(),
+            &tech.signals,
+        ) {
+            tech.version = Some(candidate);
+        }
+    }
+}
+
 /// Main application struct
 pub struct StandaloneWappalyzer {
     pub(crate) analyzer: Arc<TechnologyAnalyzer>,
@@ -227,7 +491,14 @@ impl StandaloneWappalyzer {
 
         if asset_urls.is_empty() { return; }
 
-        // --- fetch first 4 KB of each asset concurrently ---
+        // --- fetch the head (and, for JS, the tail) window of each asset concurrently ---
+        //
+        // The semaphore bounds outbound concurrency, and a permit is held across BOTH
+        // requests an asset may make, so adding the tail fetch widens no concurrency
+        // limit: it makes each slot occasionally do two sequential round trips instead of
+        // one. Asset URLs were deduplicated above, so there is exactly one task per URL
+        // and the head and tail requests for a given asset are ordered by the `.await`
+        // between them rather than racing for the same cache entry.
         let semaphore = Arc::new(Semaphore::new(config.asset_concurrency));
         // Copy out scalar config values needed inside the spawned tasks.
         let asset_timeout_secs = config.asset_timeout_secs;
@@ -237,54 +508,68 @@ impl StandaloneWappalyzer {
             let cache = Arc::clone(&asset_cache);
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.ok()?;
-                // Check cache before fetching
-                let body_arc = if let Some(cached) = cache.get(&url) {
-                    cached
-                } else {
-                    let resp = match client.get(&url)
-                        .header("Range", "bytes=0-16383")
-                        .timeout(std::time::Duration::from_secs(asset_timeout_secs))
-                        .send().await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::debug!(url = %url, "asset fetch failed: {}", e);
-                            return None;
-                        }
-                    };
-                    let status = resp.status().as_u16();
-                    if status == 200 || status == 206 {
-                        let content = match resp.text().await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::debug!(url = %url, "asset body read failed: {}", e);
-                                return None;
-                            }
-                        };
-                        let arc = Arc::new(content);
-                        cache.insert(url.clone(), Arc::clone(&arc));
-                        arc
-                    } else {
-                        return None;
-                    }
-                };
-                Some((url, body_arc))
+                // Only JS gets a tail window, because the tail exists solely to expose the
+                // trailing sourceMappingURL comment and `try_source_map` is skipped for
+                // CSS below. The predicate is deliberately the same one as that skip, so
+                // the two can't drift into fetching a tail nobody reads.
+                let wants_source_map = !url.contains(".css");
+                let (head, tail) = fetch_asset_windows(
+                    &client, &url, &cache, asset_timeout_secs, wants_source_map,
+                ).await?;
+                Some((url, head, tail))
             })
         }).collect();
 
-        let assets: Vec<(String, Arc<String>)> = futures::future::join_all(tasks).await
+        let assets: Vec<(String, Arc<String>, Option<Arc<String>>)> =
+            futures::future::join_all(tasks).await
             .into_iter()
             .filter_map(|r| r.ok().flatten())
             .collect();
 
         // --- run pattern matching on each asset ---
         let mut new_detected: HashMap<String, TechDetection> = HashMap::new();
-        for (url, content_arc) in &assets {
-            let content: &str = &content_arc;
-            analyzer.analyze_asset(url, content, &mut new_detected);
-            // Source map intelligence: parse .map files for exact npm package versions
+        for (url, head_arc, tail_arc) in &assets {
+            let head: &str = head_arc;
+            // Only the HEAD window is fed to pattern matching, never the tail. Two
+            // reasons, in order of importance:
+            //
+            // 1. Double counting. A server that ignores `Range` answers the tail request
+            //    with the whole body (see `fetch_asset_windows`), so every pattern that
+            //    already matched in the head would match again and push a SECOND
+            //    identical signal. `compute_noisy_or` reads two signals as more evidence
+            //    than one, so the asset would silently inflate its own confidence —
+            //    a detection deciding its own score, which is exactly what the
+            //    signal-weight design exists to prevent.
+            // 2. Yield. The things `analyze_asset` looks for — license banners, bundler
+            //    preambles, `@version` comments — are emitted at the TOP of a bundle by
+            //    every minifier, so the end of the file has close to nothing to offer.
+            //
+            // Discovering the trailing sourceMappingURL comment is the one job the tail
+            // has, and `try_source_map` is the only thing that reads it.
+            analyzer.analyze_asset(url, head, &mut new_detected);
+            // Source map intelligence: parse .map files for exact npm package versions.
+            //
+            // Not attempted for CSS: `try_source_map` mines `node_modules/<pkg>/...`
+            // paths out of the map's `sources` array, which is a JS dependency inventory.
+            //
+            // Considered and rejected: speculatively requesting `<asset-url>.map` when no
+            // comment is found. Some builds do ship the map while stripping the comment,
+            // so there is real yield there — but the cost is one extra request per JS
+            // asset on EVERY analysis, and a typical page links five to twenty of them,
+            // so it is a fixed multiplier on outbound traffic and wall-clock for a path
+            // that 404s on the large majority of production sites. It is also a request
+            // for a URL the target never advertised, which is the definition of the
+            // probing that `full_scan` exists to gate. If we want it, it belongs behind
+            // `full_scan` in the probe layer, not unconditionally here.
             if !url.contains(".css") {
-                analyzer.try_source_map(client, url, content, &mut new_detected, config.source_map_timeout_secs).await;
+                analyzer.try_source_map(
+                    client,
+                    url,
+                    head,
+                    tail_arc.as_ref().map(|t| t.as_str()),
+                    &mut new_detected,
+                    config.source_map_timeout_secs,
+                ).await;
             }
         }
 
@@ -293,9 +578,7 @@ impl StandaloneWappalyzer {
             let confidence = compute_noisy_or(&detection.signals);
             if confidence < min_confidence { continue; }
             if let Some(t) = technologies.iter_mut().find(|t| t.name == name) {
-                if t.version.is_none() && detection.version.is_some() {
-                    t.version = detection.version;
-                }
+                merge_version_by_source_rank(t, detection.version, &detection.signals);
                 t.signals.extend(detection.signals);
             } else {
                 let mut tech = analyzer.build_technology(&name, confidence, detection.version);
@@ -374,9 +657,7 @@ impl StandaloneWappalyzer {
             let confidence = compute_noisy_or(&detection.signals);
             if confidence < min_confidence { continue; }
             if let Some(t) = technologies.iter_mut().find(|t| t.name == name) {
-                if t.version.is_none() && detection.version.is_some() {
-                    t.version = detection.version;
-                }
+                merge_version_by_source_rank(t, detection.version, &detection.signals);
                 t.signals.extend(detection.signals);
             } else {
                 let mut tech = analyzer.build_technology(&name, confidence, detection.version);
@@ -659,6 +940,10 @@ pub fn clamp_batch_concurrency(requested: usize, url_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Dev-dependency, so these are unit-test-only imports; both fold tests below
+    // serve every request they make from a loopback mock server.
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{method, path};
 
     /// Regression guard for a remote DoS: `/batch` accepted `concurrency`
     /// verbatim, so `0` hung the request forever and `u64::MAX` panicked the
@@ -1022,6 +1307,197 @@ mod tests {
         let tags_full: Vec<_> = probes_full.iter().map(|(_, t)| *t).collect();
         assert!(tags_full.contains(&"env-file"), ".env should appear with full_scan");
         assert!(tags_full.contains(&"git-head"), ".git/HEAD should appear with full_scan");
+    }
+
+    // ── version precedence at the fold sites ──────────────────────────────────
+    //
+    // These two tests exist because a test of `version_source_rank` alone proves
+    // nothing about this file: the ranking function was already correct and already
+    // unit-tested while BOTH folds below still read `if t.version.is_none()`, which is
+    // first-write-wins and is the rule the ranking was written to replace. So they
+    // drive the real fold code — `inspect_assets` and `probe_version_endpoints`,
+    // through a wiremock origin — rather than the predicate underneath it. Restoring
+    // either `if t.version.is_none() && detection.version.is_some()` guard makes the
+    // corresponding assertion below fail.
+    //
+    // Offline: `wiremock::MockServer` binds a random loopback port and every URL used
+    // here is that server. `WappalyzerConfig::default()` has `ssrf_protection: false`,
+    // so the library path does not pre-reject a loopback target. No DNS layer runs —
+    // neither `inspect_assets` nor `probe_version_endpoints` performs a lookup — and
+    // the analyzer itself is built from the on-disk technology database
+    // (`wappalyzer_cache.json`, or `$WAPPALYZER_CACHE`), not fetched.
+
+    /// A `Technology` with only the fields these tests care about populated.
+    fn bare_tech(name: &str, version: Option<&str>, signals: Vec<Signal>) -> Technology {
+        Technology {
+            name: name.to_string(),
+            confidence: 80,
+            version: version.map(|v| v.to_string()),
+            categories: vec![],
+            website: None,
+            description: None,
+            icon: None,
+            cpe: None,
+            saas: None,
+            pricing: None,
+            signals,
+        }
+    }
+
+    /// The motivating case, end to end through the probe fold.
+    ///
+    /// A WordPress site whose assets carry `?ver=6.5.3` cache-busters: `analyze()`
+    /// stores 6.5.3 off a script tag (a query-string version, rank 20), then the probe
+    /// layer reads the site's own `/wp-json/` and gets 6.8.1 (rank 100). The fold used
+    /// to test `t.version.is_none()`, so the true version was thrown away and the tool
+    /// reported the cache-buster.
+    ///
+    /// Only `/wp-json/` is stubbed with content; every other probe in the list gets the
+    /// catch-all 404 and is discarded by `accepts_status_for_tag`.
+    #[tokio::test]
+    async fn test_probe_version_replaces_lower_ranked_version_at_the_probe_fold() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wp-json/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"name":"Test","description":"","url":"/","generator":"WordPress 6.8.1"}"#,
+            ))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let wappalyzer = StandaloneWappalyzer::new(false).await
+            .expect("StandaloneWappalyzer::new failed — is wappalyzer_cache.json present?");
+        // Use the database's own spelling: the fold matches detections to technologies
+        // by exact name, and so does `parse_probe_responses` when it resolves
+        // "WordPress".
+        let wp = wappalyzer.analyzer.find_tech_name("WordPress")
+            .expect("WordPress missing from the technology database")
+            .to_string();
+
+        let mut technologies = vec![bare_tech(
+            &wp,
+            Some("6.5.3"),
+            vec![Signal {
+                signal_type: "script_src".to_string(),
+                value: format!("{}/wp-includes/js/jquery.min.js?ver=6.5.3", mock_server.uri()),
+                weight: 50,
+            }],
+        )];
+
+        StandaloneWappalyzer::probe_version_endpoints(
+            &wappalyzer.analyzer,
+            &wappalyzer.http_client.client,
+            &format!("{}/", mock_server.uri()),
+            &mut technologies,
+            0,
+            &wappalyzer.config,
+            true,
+        ).await;
+
+        let found = technologies.iter().find(|t| t.name == wp)
+            .expect("WordPress disappeared from the technology list");
+        assert_eq!(
+            found.version.as_deref(),
+            Some("6.8.1"),
+            "a rank-100 probe version must displace the rank-20 `?ver=` cache-buster",
+        );
+    }
+
+    /// Both directions at the asset fold, which is the other place a fresh detection
+    /// map is folded into the built technology list.
+    ///
+    /// The same incoming evidence — a `/*! jQuery v3.7.1 */` banner, a rank-40
+    /// `script_src` version — is folded onto two different incumbents:
+    ///
+    /// - one whose version came from a `?ver=` query string (rank 20): the banner is
+    ///   better sourced and must replace it. This direction fails under
+    ///   first-write-wins.
+    /// - one whose version came from a `meta` generator tag (rank 80): the banner is
+    ///   worse sourced and must NOT replace it. This direction passes under
+    ///   first-write-wins too, which is exactly why it is asserted — without it the
+    ///   test would be satisfied by "always overwrite", the opposite defect.
+    #[tokio::test]
+    async fn test_asset_fold_replaces_only_a_worse_sourced_version() {
+        let mock_server = MockServer::start().await;
+        // Deliberately minimal: the banner comment is the only occurrence of the
+        // library's name in the body, so the incoming detection carries the
+        // `script_src` banner signal and nothing else that could supply a version of
+        // its own and change which rank is being tested.
+        let banner = "/*! jQuery v3.7.1 | (c) OpenJS Foundation */\n(function(){var a=1;return a;})();\n";
+        for asset in ["/low.js", "/high.js"] {
+            Mock::given(method("GET"))
+                .and(path(asset))
+                .respond_with(ResponseTemplate::new(200).set_body_string(banner))
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let wappalyzer = StandaloneWappalyzer::new(false).await
+            .expect("StandaloneWappalyzer::new failed — is wappalyzer_cache.json present?");
+        let jq = wappalyzer.analyzer.find_tech_name("jQuery")
+            .expect("jQuery missing from the technology database")
+            .to_string();
+        let base = format!("{}/", mock_server.uri());
+
+        // Direction 1: rank 40 banner over a rank 20 query-string version.
+        let mut technologies = vec![bare_tech(
+            &jq,
+            Some("1.0.0"),
+            vec![Signal {
+                signal_type: "script_src".to_string(),
+                value: format!("{}/js/jquery.min.js?ver=1.0.0", mock_server.uri()),
+                weight: 50,
+            }],
+        )];
+        StandaloneWappalyzer::inspect_assets(
+            &wappalyzer.analyzer,
+            &wappalyzer.http_client.client,
+            r#"<html><head><script src="/low.js"></script></head><body></body></html>"#,
+            &base,
+            &mut technologies,
+            0,
+            &wappalyzer.config,
+            Arc::clone(&wappalyzer.asset_cache),
+        ).await;
+        assert_eq!(
+            technologies.iter().find(|t| t.name == jq).and_then(|t| t.version.as_deref()),
+            Some("3.7.1"),
+            "a rank-40 banner version must displace a rank-20 `?ver=` version",
+        );
+
+        // Direction 2: same banner, now against a rank 80 meta-generator version.
+        let mut technologies = vec![bare_tech(
+            &jq,
+            Some("1.0.0"),
+            vec![Signal {
+                signal_type: "meta".to_string(),
+                value: "generator:jQuery 1.0.0".to_string(),
+                weight: 80,
+            }],
+        )];
+        StandaloneWappalyzer::inspect_assets(
+            &wappalyzer.analyzer,
+            &wappalyzer.http_client.client,
+            r#"<html><head><script src="/high.js"></script></head><body></body></html>"#,
+            &base,
+            &mut technologies,
+            0,
+            &wappalyzer.config,
+            Arc::clone(&wappalyzer.asset_cache),
+        ).await;
+        assert_eq!(
+            technologies.iter().find(|t| t.name == jq).and_then(|t| t.version.as_deref()),
+            Some("1.0.0"),
+            "a rank-40 banner version must NOT displace a rank-80 meta version",
+        );
     }
 }
 

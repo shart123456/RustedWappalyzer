@@ -313,11 +313,19 @@ impl TechnologyAnalyzer {
 
     /// Fetch a JS source map file referenced by `//# sourceMappingURL=` and extract
     /// npm package names (and versions when available) from the `sources` array.
+    ///
+    /// `js_body` is the head window of the asset and `js_tail`, when present, is its
+    /// last few kilobytes (see `crate::ASSET_TAIL_BYTES`). Both are needed because the
+    /// comment lives at the very END of everything a bundler emits, while the head
+    /// window is capped at 16 KB: without the tail this function is handed a body that
+    /// structurally cannot contain the comment for any bundle worth fingerprinting, and
+    /// returns at the first `match` every single time.
     pub(crate) async fn try_source_map(
         &self,
         client: &reqwest::Client,
         js_url: &str,
         js_body: &str,
+        js_tail: Option<&str>,
         detected: &mut HashMap<String, TechDetection>,
         source_map_timeout_secs: u64,
     ) {
@@ -331,9 +339,27 @@ impl TechnologyAnalyzer {
             Regex::new(r"node_modules/(@?[^/]+(?:/[^/]+)?)").unwrap()
         });
 
-        // 1. Find sourceMappingURL comment
-        let map_path = match SOURCE_MAP_RE.captures(js_body).and_then(|c| c.get(1)) {
-            Some(m) => m.as_str().to_string(),
+        // 1. Find the sourceMappingURL comment.
+        //
+        // Search the tail first and the head only as a fallback. The trailer is where
+        // bundlers put the comment, so on a truncated asset the tail is the only window
+        // that can hold it; the head is the right place to look only for a small asset
+        // that was never truncated, and such an asset has no tail window at all.
+        //
+        // Within whichever window we search, take the LAST match rather than the first:
+        // the real trailer is last by construction, whereas an earlier hit is more
+        // likely to be the literal text `//# sourceMappingURL=` sitting inside inlined
+        // source, a template string, or a comment about source maps.
+        fn last_source_map_url(re: &Regex, body: &str) -> Option<String> {
+            re.captures_iter(body)
+                .last()
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+        }
+        let map_path = match js_tail
+            .and_then(|tail| last_source_map_url(&SOURCE_MAP_RE, tail))
+            .or_else(|| last_source_map_url(&SOURCE_MAP_RE, js_body))
+        {
+            Some(p) => p,
             None => return,
         };
 

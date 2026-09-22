@@ -1,0 +1,51 @@
+{
+  "name": "mediawiki-1.41.0",
+  "image": "mediawiki:1.41.0",
+  "captured_at": "2026-09-21T23:40:16Z",
+  "captured_by": "fixtures/capture_corpus.sh",
+  "capture_url": "http://127.0.0.1:38509/",
+  "effective_url": "http://127.0.0.1:38509/",
+  "notes": "SETUP PAGE. Without LocalSettings.php MediaWiki serves mw-config/index.php (the installer).",
+  "body_truncated": false,
+  "body_original_bytes": 564,
+  "expect": [
+    {
+      "technology": "MediaWiki",
+      "version": "1.41.0",
+      "source": "image tag mediawiki:1.41.0"
+    },
+    {
+      "technology": "Apache HTTP Server",
+      "version": "2.4.57",
+      "source": "exec_probe:apache"
+    },
+    {
+      "technology": "PHP",
+      "version": "8.1.27",
+      "source": "exec_probe:php"
+    }
+  ],
+  "response": {
+    "url": "http://127.0.0.1:38509/",
+    "headers": {
+      "date": "Mon, 21 Sep 2026 23:40:16 GMT",
+      "server": "Apache/2.4.57 (Debian)",
+      "x-powered-by": "PHP/8.1.27",
+      "x-content-type-options": "nosniff",
+      "expires": "Thu, 19 Nov 1981 08:52:00 GMT",
+      "cache-control": "no-store, no-cache, must-revalidate",
+      "pragma": "no-cache",
+      "x-request-id": "36b150d88ffdcede36a7ec61",
+      "vary": "Accept-Encoding",
+      "content-length": "564",
+      "content-type": "text/html; charset=UTF-8",
+      "set-cookie": "mw_installer_session=bb9ba6ddf022e4a8d9cec331a5aa93cf; path=/"
+    },
+    "body": "<!DOCTYPE html>\n<html lang=\"en\" dir=\"ltr\">\n\t<head>\n\t\t<meta charset=\"UTF-8\" />\n\t\t<title>MediaWiki 1.41.0</title>\n\t\t<style media=\"screen\">\n\t\t\tbody {\n\t\t\t\tcolor: #000;\n\t\t\t\tbackground-color: #fff;\n\t\t\t\tfont-family: sans-serif;\n\t\t\t\ttext-align: center;\n\t\t\t}\n\n\t\t\th1 {\n\t\t\t\tfont-size: 150%;\n\t\t\t}\n\t\t</style>\n\t</head>\n\t<body>\n\t\t<img src=\"/resources/assets/mediawiki.png\" alt=\"The MediaWiki logo\" />\n\n\t\t<h1>MediaWiki 1.41.0</h1>\n\t\t<div>\n\t\t\t<p>LocalSettings.php not found.</p>\n\t\t\t\t<p>Please <a href=\"/mw-config/index.php\">set up the wiki</a> first.</p>\n\t\t</div>\n\t</body>\n</html>\n",
+    "status_code": 200,
+    "response_time_ms": 3,
+    "set_cookie_headers": [
+      "mw_installer_session=bb9ba6ddf022e4a8d9cec331a5aa93cf; path=/"
+    ]
+  }
+}

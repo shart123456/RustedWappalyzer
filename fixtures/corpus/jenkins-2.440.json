@@ -1,0 +1,44 @@
+{
+  "name": "jenkins-2.440",
+  "image": "jenkins/jenkins:2.440",
+  "captured_at": "2026-09-21T23:41:10Z",
+  "captured_by": "fixtures/capture_corpus.sh",
+  "capture_url": "http://127.0.0.1:38510/",
+  "effective_url": "http://127.0.0.1:38510/",
+  "notes": "Jenkins redirects an unauthenticated / to the setup wizard or the login page depending on how far first-run setup got. Slow: allow well over a minute. Jetty is expected WITHOUT a version because the image tag pins Jenkins, not the bundled servlet container -- writing a Jetty version here would be a guess, and guesses do not belong in a ground-truth file.",
+  "body_truncated": false,
+  "body_original_bytes": 589,
+  "expect": [
+    {
+      "technology": "Jenkins",
+      "version": "2.440",
+      "source": "image tag jenkins/jenkins:2.440"
+    },
+    {
+      "technology": "Jetty",
+      "version": null,
+      "source": "bundled servlet container; version not pinned by the image tag"
+    }
+  ],
+  "response": {
+    "url": "http://127.0.0.1:38510/",
+    "headers": {
+      "date": "Mon, 21 Sep 2026 23:41:10 GMT",
+      "x-content-type-options": "nosniff",
+      "expires": "Thu, 01 Jan 1970 00:00:00 GMT",
+      "content-type": "text/html;charset=utf-8",
+      "x-hudson": "1.395",
+      "x-jenkins": "2.440",
+      "x-jenkins-session": "78ad9f81",
+      "transfer-encoding": "chunked",
+      "server": "Jetty(10.0.18)",
+      "set-cookie": "JSESSIONID.f631d359=node01g994emew20ubo8ox2ezdm9if1.node0; Path=/; HttpOnly"
+    },
+    "body": "<html><head><meta http-equiv='refresh' content='1;url=/login?from=%2F'/><script id='redirect' data-redirect-url='/login?from=%2F' src='/static/78ad9f81/scripts/redirect.js'></script></head><body style='background-color:white; color:white;'>\nAuthentication required\n<!--\n-->\n\n</body></html>                                                                                                                                                                                                                                                                                                            ",
+    "status_code": 403,
+    "response_time_ms": 2,
+    "set_cookie_headers": [
+      "JSESSIONID.f631d359=node01g994emew20ubo8ox2ezdm9if1.node0; Path=/; HttpOnly"
+    ]
+  }
+}
